@@ -1,0 +1,24 @@
+# Core Dependencies
+numpy>=1.19.0
+matplotlib>=3.3.0
+scipy>=1.6.0
+pandas>=1.2.0
+
+# FEniCS - Must be installed via conda
+# conda install -c conda-forge fenics
+# Note: FEniCS cannot be installed via pip reliably
+
+# MPI Support (optional but recommended for parallel simulations)
+mpi4py>=3.0.0
+
+# GUI Dependencies (tkinter usually comes with Python)
+# On some Linux systems you may need: sudo apt-get install python3-tk
+
+# Development Dependencies (optional)
+pytest>=6.0.0
+setuptools>=45.0.0
+wheel>=0.36.0
+
+# Jupyter notebook support (optional)
+jupyter>=1.0.0
+ipykernel>=5.0.0
