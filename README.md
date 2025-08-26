@@ -43,13 +43,6 @@ conda install -c conda-forge fenics
 # Verify installation
 python -c "import dolfin; print('FEniCS installed successfully')"
 
-
-# Create a new conda environment
-conda create -n fenics python=3.9
-
-# Activate the environment
-conda activate fenics
-
 # Install FEniCS from conda-forge
 conda install -c conda-forge fenics
 
