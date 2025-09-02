@@ -78,7 +78,9 @@ class ThermalMesh:
             
         # Get mesh size
         h_min = self.mesh.hmin()
-        
+        h_max = self.mesh.hmax()
+        h_char = np.sqrt(h_min*h_max)
+
         # Material properties
         k = self.parameters['k']
         rho = self.parameters['rho']
@@ -88,7 +90,7 @@ class ThermalMesh:
         alpha = k / (rho * cp)
         
         # Stability condition: dt <= h²/(6*alpha) for 3D
-        dt_stable = (h_min**2) / (6 * alpha)
+        dt_stable = (h_char**2) / (6 * alpha)
         
         print(f"Minimum element size: {h_min*1000:.4f} mm")
         print(f"Thermal diffusivity: {alpha*1e6:.2f} mm²/s")
@@ -96,161 +98,192 @@ class ThermalMesh:
         
         return dt_stable
 
-    # def adaptive_mesh_refinement(self, u, laser_criteria=None):
-    #     """Perform adaptive mesh refinement based on temperature gradients and laser position"""
-    #     if not self.parameters.get('adaptive_refinement', False):
-    #         return False
-    
-    #     try:
-    #         # Calculate temperature gradient magnitude
-    #         DG = df.FunctionSpace(self.mesh, "DG", 0)
-    #         grad_u = df.project(df.sqrt(df.dot(df.grad(u), df.grad(u))), DG)
-            
-    #         # Get refinement parameters
-    #         threshold = self.parameters['refinement_threshold'] * grad_u.vector().max()
-    #         min_cell_size = self.parameters['min_cell_size']
-            
-    #         # Get laser info from criteria
-    #         if laser_criteria:
-    #             laser_x, laser_y = laser_criteria['laser_position']
-    #             laser_radius = laser_criteria['laser_radius']
-    #             T_melt = laser_criteria['T_melt']
-    #         else:
-    #             # Fallback values
-    #             laser_x = self.parameters['length'] / 2
-    #             laser_y = self.parameters['width'] / 2
-    #             laser_radius = self.parameters['beam_radius']
-    #             T_melt = self.parameters.get('T_melt', 3103.0)
-
-    #         # Mark cells for refinement
-    #         cell_markers = df.MeshFunction("bool", self.mesh, self.mesh.topology().dim())
-    #         cell_markers.set_all(False)
-            
-    #         cells_to_refine = 0
-            
-    #         for cell in df.cells(self.mesh):
-    #             midpoint = cell.midpoint()
-                
-    #             # Check if cell is large enough to refine
-    #             if cell.h() > min_cell_size:
-    #                 # Criterion 1: High temperature gradient
-    #                 high_gradient = grad_u(midpoint) > threshold
-                    
-    #                 # Criterion 2: Near laser spot
-    #                 distance = ((midpoint.x() - laser_x)**2 + (midpoint.y() - laser_y)**2)**0.5
-    #                 near_laser = distance < 3 * laser_radius
-                    
-    #                 # Criterion 3: High temperature (near melting)
-    #                 high_temp = False
-    #                 try:
-    #                     temp_at_point = u(midpoint)
-    #                     high_temp = temp_at_point > 0.8 * T_melt
-    #                 except:
-    #                     high_temp = False
-                    
-    #                 if high_gradient or near_laser or high_temp:
-    #                     cell_markers[cell] = True
-    #                     cells_to_refine += 1
-            
-    #         # Only refine if we have cells to refine
-    #         if cells_to_refine > 0:
-    #             print(f"Refining {cells_to_refine} cells...")
-                
-    #             # Store old mesh info
-    #             old_num_cells = self.mesh.num_cells()
-                
-    #             # Refine the mesh
-    #             new_mesh = df.refine(self.mesh, cell_markers)
-                
-    #             # Update mesh reference
-    #             self.mesh = new_mesh
-                
-    #             print(f"Mesh refined: {old_num_cells} -> {new_mesh.num_cells()} cells")
-    #             return True
-            
-    #         return False
-            
-    #     except Exception as e:
-    #         print(f"Warning: Adaptive refinement failed: {e}")
-    #         return False
-
-    def adaptive_mesh_refinement(self, u, laser_criteria=None):
-        """Perform adaptive mesh refinement based on temperature gradients and laser position"""
-        if not self.parameters.get('adaptive_refinement', False):
-            return False
-
-        try:
-            print("DEBUG: Starting mesh refinement...")
-            
-            # Calculate temperature gradient magnitude
-            print("DEBUG: Creating DG function space...")
-            DG = df.FunctionSpace(self.mesh, "DG", 0)
-            
-            print("DEBUG: Projecting gradient...")
-            grad_u = df.project(df.sqrt(df.dot(df.grad(u), df.grad(u))), DG)
-            
-            print("DEBUG: Getting refinement parameters...")
-            threshold = self.parameters['refinement_threshold'] * grad_u.vector().max()
-            min_cell_size = self.parameters['min_cell_size']
-            
-            # Get laser info from criteria
-            if laser_criteria:
-                laser_x, laser_y = laser_criteria['laser_position']
-                laser_radius = laser_criteria['laser_radius']
-                T_melt = laser_criteria['T_melt']
-            else:
-                laser_x = self.parameters['length'] / 2
-                laser_y = self.parameters['width'] / 2
-                laser_radius = self.parameters['beam_radius']
-                T_melt = self.parameters.get('T_melt', 3103.0)
-
-            print("DEBUG: Creating cell markers...")
-            cell_markers = df.MeshFunction("bool", self.mesh, self.mesh.topology().dim())
-            cell_markers.set_all(False)
-            
-            cells_to_refine = 0
-            
-            print("DEBUG: Checking cells for refinement...")
-            for cell in df.cells(self.mesh):
-                midpoint = cell.midpoint()
-                
-                if cell.h() > min_cell_size:
-                    # Simplified criteria to avoid potential issues
-                    distance = ((midpoint.x() - laser_x)**2 + (midpoint.y() - laser_y)**2)**0.5
-                    near_laser = distance < 3 * laser_radius
-                    
-                    if near_laser:  # Only use laser proximity for now
-                        cell_markers[cell] = True
-                        cells_to_refine += 1
-            
-            print(f"DEBUG: Found {cells_to_refine} cells to refine")
-            
-            if cells_to_refine > 0:
-                print("DEBUG: About to call df.refine...")
-                old_num_cells = self.mesh.num_cells()
-                
-                # This is likely where the error occurs
-                new_mesh = df.refine(self.mesh, cell_markers)
-                
-                print("DEBUG: df.refine completed successfully")
-                self.mesh = new_mesh
-                
-                print(f"Mesh refined: {old_num_cells} -> {new_mesh.num_cells()} cells")
-                return True
-            
-            return False
-            
-        except Exception as e:
-            print(f"ERROR in mesh refinement at step: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def _default_refinement_criteria(self, u, mesh):
-        """Default refinement criteria based on temperature gradient"""
-        # Calculate gradient magnitude at each cell
-        DG = df.FunctionSpace(mesh, "DG", 0)
-        grad_u = df.project(df.sqrt(df.dot(df.grad(u), df.grad(u))), DG)
+    def create_statisic_optimized_mesh(self, comm=None):
+        """Create optimized mesh once - never changes during simulation"""
         
-        # Return gradient values as refinement indicators
-        return grad_u.vector().get_local()
+        beam_diameter = 2 * self.parameters['beam_radius']  # 1mm
+        thickness = self.parameters['height']               # 0.5mm
+        L = self.parameters['length']                       # 8mm
+        W = self.parameters['width']                        # 8mm
+        
+        laser_x = self.parameters.get('laser_start_x', L/2)
+        laser_y = self.parameters.get('laser_start_y', W/2)
+        
+        # print("Creating STATIC mesh (no refinement during simulation)")
+        print("Creating MEMORY-EFFICIENT static mesh")
+        print(f"Beam diameter: {beam_diameter*1000:.1f}mm, Sheet thickness: {thickness*1000:.2f}mm")
+            
+        # Calculate optimal initial resolution
+        # Core zone: 0.05mm elements (20 across 1mm beam)
+        # Medium zone: 0.1mm elements  
+        # Far zone: 0.2-0.4mm elements
+        
+        # Method 1: Direct high-resolution mesh
+        # elements_across_beam = 20
+        # core_element_size = beam_diameter / elements_across_beam  # 0.05mm
+        base_resolution = self.parameters.get('mesh_resolution', 35)
+
+        # Calculate required base resolution
+        nx =  base_resolution  # Start coarser, will refine zones
+        ny = base_resolution
+        nz = max(4, int(base_resolution * thickness / L))  # 5 layers through 0.5mm thickness = 0.1mm per layer
+        
+        print(f"GUI mesh resolution: {base_resolution}")
+        print(f"Base mesh: {nx} x {ny} x {nz} = {nx*ny*nz} cells")
+        print(f"Element size: {L/nx*1000:.2f} x {W/ny*1000:.2f} x {thickness/nz*1000:.2f} mm")
+    
+        # Create base mesh
+        if comm is not None:
+            self.mesh = df.BoxMesh(comm, df.Point(0, 0, 0), df.Point(L, W, thickness), 
+                                nx, ny, nz)
+        else:
+            self.mesh = df.BoxMesh(df.Point(0, 0, 0), df.Point(L, W, thickness), 
+                                nx, ny, nz)
+        
+        print(f"Initial mesh: {self.mesh.num_cells()} cells")
+        
+        # Pre-refine zones based on distance from laser (ONCE ONLY)
+        # self._prerefine_zones_static(laser_x, laser_y, beam_diameter)
+        self._conservative_refinement_gui_based(laser_x, laser_y, beam_diameter, base_resolution)
+
+        print(f"Final STATIC mesh: {self.mesh.num_cells()} cells")
+        print("Mesh will NOT change during simulation")
+        
+        return self.mesh
+
+    def _prerefine_zones_static(self, laser_x, laser_y, beam_diameter):
+        """Pre-refine zones once - mesh then stays fixed"""
+        
+        beam_radius = beam_diameter / 2
+        
+        # Zone definitions for 1mm beam
+        zones = [
+            {'radius': 0.3e-3, 'refinements': 3},  # Ultra-fine core
+            {'radius': 0.7e-3, 'refinements': 2},  # Fine near-field
+            {'radius': 1.5e-3, 'refinements': 2},  # Medium field
+            {'radius': 3.0e-3, 'refinements': 1},  # Transition zone
+        ]
+        
+        total_refinements = 0
+        
+        for zone_idx, zone in enumerate(zones):
+            print(f"\nPre-refining zone {zone_idx+1}: r < {zone['radius']*1000:.1f}mm")
+            
+            for ref_level in range(zone['refinements']):
+                cell_markers = df.MeshFunction("bool", self.mesh, self.mesh.topology().dim())
+                cell_markers.set_all(False)
+                
+                cells_marked = 0
+                
+                for cell in df.cells(self.mesh):
+                    midpoint = cell.midpoint()
+                    
+                    distance = np.sqrt((midpoint.x() - laser_x)**2 + 
+                                    (midpoint.y() - laser_y)**2)
+                    
+                    if distance < zone['radius']:
+                        cell_markers[cell] = True
+                        cells_marked += 1
+                
+                if cells_marked > 0:
+                    print(f"  Level {ref_level+1}: refining {cells_marked} cells")
+                    self.mesh = df.refine(self.mesh, cell_markers)
+                    total_refinements += 1
+                else:
+                    print(f"  Level {ref_level+1}: no cells to refine")
+                    break
+                
+                # Safety check
+                if self.mesh.num_cells() > 200000:
+                    print(f"  Stopping: mesh has {self.mesh.num_cells()} cells")
+                    return
+        
+        print(f"\nCompleted {total_refinements} total refinements")
+
+    def create_direct_high_res_mesh(self, comm=None):
+        """Create high-resolution mesh directly - no refinement at all"""
+        
+        L = self.parameters['length']     # 8mm
+        W = self.parameters['width']      # 8mm  
+        H = self.parameters['height']     # 0.5mm
+        beam_radius = self.parameters['beam_radius']  # 0.5mm
+        
+        # Target: 0.1mm elements in center, 0.4mm at edges
+        # For 1mm beam, use:
+        nx = 60  # 8mm / 60 = 0.133mm average (finer near center)
+        ny = 60  # 8mm / 60 = 0.133mm average  
+        nz = 5   # 0.5mm / 5 = 0.1mm layers
+        
+        print(f"Creating direct high-res mesh: {nx} x {ny} x {nz}")
+        print(f"Average element size: {L/nx*1000:.2f} x {W/ny*1000:.2f} x {H/nz*1000:.2f} mm")
+        
+        if comm is not None:
+            self.mesh = df.BoxMesh(comm, df.Point(0, 0, 0), df.Point(L, W, H), nx, ny, nz)
+        else:
+            self.mesh = df.BoxMesh(df.Point(0, 0, 0), df.Point(L, W, H), nx, ny, nz)
+        
+        print(f"Final mesh: {self.mesh.num_cells()} cells (STATIC)")
+        return self.mesh
+
+    def _conservative_refinement_gui_based(self, laser_x, laser_y, beam_diameter, gui_resolution):
+        """Apply refinement scaled to GUI resolution"""
+        
+        beam_radius = beam_diameter / 2
+        
+        # Scale refinement based on GUI resolution
+        if gui_resolution <= 20:
+            # Coarse GUI setting - minimal refinement
+            zones = [
+                {'radius': 0.5e-3, 'refinements': 1},  # Just one level
+            ]
+            max_cells = 20000
+        elif gui_resolution <= 35:
+            # Medium GUI setting - moderate refinement  
+            zones = [
+                {'radius': 0.4e-3, 'refinements': 2},  # Core
+                {'radius': 1.0e-3, 'refinements': 1},  # Near field
+            ]
+            max_cells = 50000
+        else:
+            # Fine GUI setting - more refinement
+            zones = [
+                {'radius': 0.3e-3, 'refinements': 2},  # Core
+                {'radius': 0.7e-3, 'refinements': 1},  # Near field  
+                {'radius': 1.5e-3, 'refinements': 1},  # Medium field
+            ]
+            max_cells = 80000
+        
+        print(f"GUI resolution {gui_resolution} -> max {max_cells} cells")
+        
+        # Apply refinement with memory limit
+        for zone_idx, zone in enumerate(zones):
+            if self.mesh.num_cells() > max_cells:
+                print(f"Stopping refinement: {self.mesh.num_cells()} cells exceeds limit {max_cells}")
+                break
+                
+            print(f"Refining zone {zone_idx+1}: r < {zone['radius']*1000:.1f}mm")
+            
+            for ref_level in range(zone['refinements']):
+                if self.mesh.num_cells() > max_cells:
+                    print(f"  Stopping at {self.mesh.num_cells()} cells")
+                    break
+                    
+                cell_markers = df.MeshFunction("bool", self.mesh, self.mesh.topology().dim())
+                cell_markers.set_all(False)
+                
+                cells_marked = 0
+                for cell in df.cells(self.mesh):
+                    midpoint = cell.midpoint()
+                    distance = np.sqrt((midpoint.x() - laser_x)**2 + (midpoint.y() - laser_y)**2)
+                    
+                    if distance < zone['radius']:
+                        cell_markers[cell] = True
+                        cells_marked += 1
+                
+                if cells_marked > 0:
+                    print(f"  Refining {cells_marked} cells")
+                    self.mesh = df.refine(self.mesh, cell_markers)
+                    print(f"  New mesh size: {self.mesh.num_cells()} cells")
+                else:
+                    print(f"  No cells to refine in zone {zone_idx+1}")
+                    break

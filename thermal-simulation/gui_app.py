@@ -15,6 +15,7 @@ from pathlib import Path
 from simulation.fixed_temp import FixedTempSimulation
 from simulation.laser_heating import LaserHeatingSimulation
 from simulation import check_dependencies
+import math
 
 class ThermalSimulationGUI:
     def __init__(self, root):
@@ -29,6 +30,7 @@ class ThermalSimulationGUI:
             return
 
         # Simulation state
+        self.colorbars = []
         self.current_simulation = None
         self.simulation_running = False
         self.simulation_thread = None
@@ -98,38 +100,243 @@ class ThermalSimulationGUI:
         # Status and progress
         self.create_status_panel(parent)
 
+
     def create_material_tab(self):
         """Create material properties tab"""
         frame = ttk.Frame(self.notebook)
         self.notebook.add(frame, text="Material")
         
-        #Default material properties
+        # Basic material properties
+        basic_frame = ttk.LabelFrame(frame, text="Base Material Properties")
+        basic_frame.pack(fill="x", padx=5, pady=5)
+        
         material_params = [
-            ("Thermal Conductivity (W/m·K)", "k", 170.0),
-            ("Density (kg/m³)", "rho", 3200.0),
-            ("Specific Heat (J/kg·K)", "cp", 510.0),
+            ("Thermal Conductivity (W/m·K)", "k", 370.0), #120
+            ("Density (kg/m³)", "rho", 3210.0),
+            ("Specific Heat (J/kg·K)", "cp", 316.6), #750
             ("Melting Temperature (K)", "T_melt", 3103.0),
             ("Ambient Temperature (K)", "T_ambient", 298.0),
-            ("Emissivity", "emissivity", 0.8),  # Added emissivity
+            ("Emissivity", "emissivity", 0.9),
             ("Stefan-Boltzmann Constant", "stefan_boltzmann", 5.67e-8)
         ]
         
         for i, (label, key, default) in enumerate(material_params):
-            ttk.Label(frame, text=label).grid(row=i, column=0, sticky='w', padx=5, pady=5)
-
+            ttk.Label(basic_frame, text=label).grid(row=i, column=0, sticky='w', padx=5, pady=2)
+            
             if key == "stefan_boltzmann":
-            # Make Stefan-Boltzmann constant read-only (it's a physical constant)
                 var = tk.DoubleVar(value=default)
-                entry = ttk.Entry(frame, textvariable=var, width=15, state='readonly')
-                ttk.Label(frame, text="(Physical constant)", font=('TkDefaultFont', 8, 'italic')).grid(
+                entry = ttk.Entry(basic_frame, textvariable=var, width=15, state='readonly')
+                ttk.Label(basic_frame, text="(Physical constant)", font=('TkDefaultFont', 8, 'italic')).grid(
                     row=i, column=2, sticky='w', padx=5)
             else:
                 var = tk.DoubleVar(value=default)
-                entry = ttk.Entry(frame, textvariable=var, width=15)
-
-            entry.grid(row=i, column=1, padx=5, pady=5)
+                entry = ttk.Entry(basic_frame, textvariable=var, width=15)
+            
+            entry.grid(row=i, column=1, padx=5, pady=2)
             self.param_vars[key] = var
 
+        # Temperature-dependent properties section
+        temp_dep_frame = ttk.LabelFrame(frame, text="Temperature-Dependent Properties")
+        temp_dep_frame.pack(fill="x", padx=5, pady=5)
+
+        # Enable checkbox
+        self.use_temp_dep_var = tk.BooleanVar(value=False)
+        enable_checkbox = ttk.Checkbutton(temp_dep_frame, 
+                                        text="Enable temperature-dependent properties", 
+                                        variable=self.use_temp_dep_var,
+                                        command=self.toggle_temp_dependent_widgets)
+        enable_checkbox.pack(anchor="w", padx=5, pady=5)
+
+        # Base values frame (these are used in equations as k_base, rho_base, cp_base)
+        self.base_frame = ttk.LabelFrame(temp_dep_frame, text="Base Values (for use in equations)")
+        self.base_frame.pack(fill="x", padx=5, pady=5)
+
+        base_params = [
+            ("k_base (W/m·K)", "k_base", 370.0),
+            ("rho_base (kg/m³)", "rho_base", 3210.0),
+            ("cp_base (J/kg·K)", "cp_base", 316.6),
+        ]
+
+        for i, (label, key, default) in enumerate(base_params):
+            ttk.Label(self.base_frame, text=label).grid(row=i, column=0, sticky='w', padx=5, pady=2)
+            var = tk.DoubleVar(value=default)
+            entry = ttk.Entry(self.base_frame, textvariable=var, width=15)
+            entry.grid(row=i, column=1, padx=5, pady=2)
+            self.param_vars[key] = var
+
+        # Custom equations frame
+        self.equations_frame = ttk.LabelFrame(temp_dep_frame, text="Custom Equations (use T for temperature)")
+        self.equations_frame.pack(fill="x", padx=5, pady=5)
+
+        # Equation inputs
+        # Set these as your defaults in equation_params:
+        equation_params = [
+            # Thermal conductivity κ(T) [W/m·K] 
+            # Decreases with T (phonon scattering)
+            ("κ(T) =", "k_equation", "k_base * (T/298)**(-0.85)"),  
+            
+            # Density ρ(T) [kg/m³]
+            # Decreases slightly with T (thermal expansion)
+            ("ρ(T) =", "rho_equation", "rho_base * (1 - 1.2e-5 * (T - 298))"),  
+            
+            # Specific heat Cp(T) [J/kg·K]
+            # Increases with T, Debye-like saturation
+            ("Cp(T) =", "cp_equation", "cp_base + 2.44*T - 1.65e5/(T**2)"),  
+        ]
+
+        for i, (label, key, default) in enumerate(equation_params):
+            ttk.Label(self.equations_frame, text=label).grid(row=i, column=0, sticky='w', padx=5, pady=2)
+            var = tk.StringVar(value=default)
+            entry = ttk.Entry(self.equations_frame, textvariable=var, width=50)
+            entry.grid(row=i, column=1, padx=5, pady=2, sticky='ew')
+            self.param_vars[key] = var
+
+        # Configure column weights for resizing
+        self.equations_frame.columnconfigure(1, weight=1)
+
+        # Test equations button
+        self.test_button = ttk.Button(self.equations_frame, text="Test Equations", 
+                                    command=self.test_equations)
+        self.test_button.grid(row=len(equation_params), column=0, columnspan=2, pady=10)
+
+        # Help text
+        help_text = """Available functions: sin, cos, tan, exp, log, log10, sqrt, abs, min, max, pow
+    Available constants: pi, e
+    Available variables: T (temperature), k_base, rho_base, cp_base
+
+    Examples:
+    • k_base * (1 + 0.001 * T)                    # Linear increase
+    • rho_base * exp(-0.0001 * (T - 298))         # Exponential decay  
+    • cp_base + 0.5 * T + 0.0001 * T**2          # Polynomial
+    • k_base * (1 + sin(T/1000)) * exp(-T/5000)  # Complex function"""
+
+        self.help_label = ttk.Label(temp_dep_frame, text=help_text, 
+                                font=('TkDefaultFont', 8), foreground='gray')
+        self.help_label.pack(anchor="w", padx=5, pady=5)
+
+        # Initially disable temp-dependent widgets
+        self.toggle_temp_dependent_widgets()
+
+    def toggle_temp_dependent_widgets(self):
+        """Enable/disable temperature-dependent property widgets"""
+        state = 'normal' if self.use_temp_dep_var.get() else 'disabled'
+        
+        # Toggle all widgets in the frames
+        for widget in self.base_frame.winfo_children():
+            if isinstance(widget, ttk.Entry):
+                widget.configure(state=state)
+        
+        for widget in self.equations_frame.winfo_children():
+            if isinstance(widget, (ttk.Entry, ttk.Button)):
+                widget.configure(state=state)
+
+    def test_equations(self):
+        """Test custom equations with sample temperatures"""
+        try:
+            base_vars = {
+                'k_base': self.param_vars['k_base'].get(),
+                'rho_base': self.param_vars['rho_base'].get(),
+                'cp_base': self.param_vars['cp_base'].get(),
+            }
+            
+            equations = {
+                'k': self.param_vars['k_equation'].get(),
+                'rho': self.param_vars['rho_equation'].get(),
+                'cp': self.param_vars['cp_equation'].get(),
+            }
+            
+            print(f"Base vars: {base_vars}")  # Debug print
+            print(f"Equations: {equations}")  # Debug print
+            
+            # Test temperatures
+            test_temps = [298, 500, 1000, 1500, 2000, 3000]
+            
+            results = []
+            for T in test_temps:
+                row = [f"{T}K"]
+                for prop in ['k', 'rho', 'cp']:
+                    try:
+                        # Create a simple evaluator instead of importing EquationParser
+                        equation = equations[prop]
+                        
+                        # Create evaluation environment
+                        eval_vars = {
+                            'T': T,
+                            'k_base': base_vars['k_base'],
+                            'rho_base': base_vars['rho_base'],
+                            'cp_base': base_vars['cp_base'],
+                            'exp': math.exp,
+                            'sin': math.sin,
+                            'cos': math.cos,
+                            'tan': math.tan,
+                            'log': math.log,
+                            'log10': math.log10,
+                            'sqrt': math.sqrt,
+                            'abs': abs,
+                            'min': min,
+                            'max': max,
+                            'pow': pow,
+                            'pi': math.pi,
+                            'e': math.e
+                        }
+                        
+                        # Evaluate the equation
+                        result = eval(equation, {"__builtins__": {}}, eval_vars)
+                        row.append(f"{result:.2f}")
+                        
+                    except Exception as e:
+                        print(f"Error evaluating {prop} equation '{equation}': {e}")  # Debug print
+                        row.append(f"ERROR: {str(e)}")
+                results.append(row)
+            
+            # Show results in a popup
+            self.show_equation_test_results(results)
+            
+        except Exception as e:
+            print(f"Overall error: {e}")  # Debug print
+            tk.messagebox.showerror("Equation Test Error", f"Error testing equations: {e}")
+
+    def show_equation_test_results(self, results):
+        """Show equation test results in a popup window"""
+        result_window = tk.Toplevel(self.root)
+        result_window.title("Equation Test Results")
+        result_window.geometry("600x400")
+        
+        # Create table
+        columns = ['Temperature', 'k(T)', 'ρ(T)', 'cp(T)']
+        tree = ttk.Treeview(result_window, columns=columns, show='headings')
+        
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=120)
+        
+        for row in results:
+            tree.insert('', 'end', values=row)
+        
+        tree.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Add close button
+        ttk.Button(result_window, text="Close", 
+                command=result_window.destroy).pack(pady=5)
+
+    def get_simulation_parameters(self):
+        """Collect all parameters from GUI"""
+        params = {}
+        
+        # Collect all parameter variables
+        for key, var in self.param_vars.items():
+            try:
+                params[key] = var.get()
+            except tk.TclError:
+                # Handle empty or invalid entries
+                params[key] = 0
+        
+        # Add temperature-dependent property settings
+        params['use_temperature_dependent_properties'] = self.use_temp_dep_var.get()
+        params['property_variation_type'] = 'custom_equation'
+        
+        return params
+            
     def start_timer(self):
         """Start the simulation timer"""
         import time
@@ -164,7 +371,7 @@ class ThermalSimulationGUI:
             ("Length (m)", "length", 0.008),
             ("Width (m)", "width", 0.008),
             ("Height (m)", "height", 0.0005),
-            ("Mesh Resolution", "mesh_resolution", 10),
+            ("Base Mesh Resolution", "mesh_resolution", 10),
         ]
         
         for i, (label, key, default) in enumerate(geometry_params):
@@ -193,6 +400,7 @@ class ThermalSimulationGUI:
             ("Total Time (s)", "total_time", 10.0),
             ("Time Step (s)", "dt", 0.01),
             ("Output Interval", "output_interval", 10),
+            ("Time Output Interval (s)", "output_time_interval", 0.5), 
             ("Convection Coefficient (W/m²·K)", "convection_coeff", 0.0),
         ]
 
@@ -205,6 +413,12 @@ class ThermalSimulationGUI:
             entry = ttk.Entry(frame, textvariable=var, width=15)
             entry.grid(row=i, column=1, padx=5, pady=5)
             self.param_vars[key] = var
+
+            # Add help text for the new parameter
+            if key == "output_time_interval":
+                help_text = ttk.Label(frame, text="(How often to save results in real time)", 
+                                    font=('TkDefaultFont', 8, 'italic'))
+                help_text.grid(row=i, column=2, sticky='w', padx=5)
 
         # TIME SCALING SECTION
         row = len(sim_params)
@@ -261,42 +475,7 @@ class ThermalSimulationGUI:
         separator2 = ttk.Separator(frame, orient='horizontal')
         separator2.grid(row=row, column=0, columnspan=3, sticky='ew', padx=5, pady=10)
         
-        row += 1
-        ttk.Label(frame, text="Adaptive Mesh Refinement", 
-                font=('TkDefaultFont', 10, 'bold')).grid(row=row, column=0, columnspan=2, 
-                                                        sticky='w', padx=5, pady=5)
 
-        adaptive_params = [
-            ("Enable Adaptive Refinement", "adaptive_refinement", True, 'bool'),
-            ("Refinement Interval (steps)", "refinement_interval", 10, 'int'),
-            ("Refinement Threshold", "refinement_threshold", 0.6, 'float'),
-            ("Max Refinement Levels", "max_refinement_levels", 3, 'int'),
-            ("Min Cell Size (m)", "min_cell_size", 1e-5, 'float'),
-        ]
-        
-        for i, param_info in enumerate(adaptive_params):
-            current_row = row + 1 + i
-            
-            if len(param_info) == 4:
-                label, key, default, param_type = param_info
-            else:
-                label, key, default = param_info
-                param_type = 'float'
-            
-            ttk.Label(frame, text=label).grid(row=current_row, column=0, sticky='w', padx=5, pady=5)
-            
-            if param_type == 'bool':
-                var = tk.BooleanVar(value=default)
-                widget = ttk.Checkbutton(frame, variable=var)
-            elif param_type == 'int':
-                var = tk.IntVar(value=default)
-                widget = ttk.Entry(frame, textvariable=var, width=15)
-            else:  # float
-                var = tk.DoubleVar(value=default)
-                widget = ttk.Entry(frame, textvariable=var, width=15)
-            
-            widget.grid(row=current_row, column=1, padx=5, pady=5)
-            self.param_vars[key] = var
 
         # Add time scaling info display at the bottom
         info_frame = ttk.LabelFrame(frame, text="Time Scaling Info")
@@ -800,6 +979,14 @@ class ThermalSimulationGUI:
 
     def clear_plots(self):
         """Clear all plots"""
+
+        for cbar in self.colorbars:
+            try:
+                cbar.remove()
+            except:
+                pass  # Colorbar might already be removed
+        self.colorbars.clear()
+
         for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
             ax.clear()
             ax.set_title("No data")

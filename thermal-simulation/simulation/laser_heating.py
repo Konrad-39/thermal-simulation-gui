@@ -11,6 +11,9 @@ from scipy.interpolate import interp1d
 import pandas as pd  
 from .Mesh import ThermalMesh
 from .timestep import TimeSteppingSolver
+import ast
+import operator
+import math
 
 try:
     import dolfin as df
@@ -29,7 +32,7 @@ class LaserHeatingSimulation(SimulationBase):
         # Initialize handlers as None - will be created after parameters are set
         self.mesh_handler = None
         self.time_solver = None
-        
+        self.colorbars = []
         self.default_parameters = {
             # Material properties (need to set these to SiC)
             'k': 120.0,           # Thermal conductivity W/m·K
@@ -38,6 +41,21 @@ class LaserHeatingSimulation(SimulationBase):
             'T_ambient': 298.0,  # Ambient temperature K
             'T_melt': 3103.0,    # Melting temperature K
             'T_vaporization': 3134.0,  # Vaporization temperature K
+
+                # Temperature-dependent material properties
+            'use_temperature_dependent_properties': False,
+            'property_variation_type': 'custom_equation',  # 'linear', 'polynomial', 'piecewise', 'from_file', 'custom_equation'
+            
+            # Custom equation support
+            'k_equation': '1600/T**(0.85) + 400/T',      # Custom equation for k(T)
+            'rho_equation': 'rho_base*(1-(1.2*10**-5)*(T-298)',         # Custom equation for rho(T)
+            'cp_equation': '316.6 + 2.44*T-(1.65*10**5)/T**2',                    # Custom equation for cp(T)
+            
+            # Base values for equations (can be referenced in equations)
+            'k_base': 120.0,
+            'rho_base': 3200.0,
+            'cp_base': 750.0,
+            
             
             # Geometry (3D)
             'length': 0.008,      # m (x-direction)
@@ -71,18 +89,7 @@ class LaserHeatingSimulation(SimulationBase):
         self.power_interpolator = None
 
         self.parameters = self.default_parameters.copy()
-        
-        self.parameters.update({
-            'adaptive_refinement': True,
-            'refinement_interval': 10,  # Refine every N steps
-            'refinement_threshold': 0.6,  # Fraction of max gradient for refinement
-            'max_refinement_levels': 3,  # Prevent infinite refinement
-            'min_cell_size': 1e-5,  # Minimum allowed cell size
-        })
-
-        if 'beam_radius' in self.parameters:
-            self.parameters['min_cell_size'] = self.parameters['beam_radius'] / 50
-
+    
 
         # FEniCS objects
         self.mesh = None
@@ -124,12 +131,12 @@ class LaserHeatingSimulation(SimulationBase):
         try:
             # Try to read as CSV first
             if power_file.lower().endswith('.csv'):
-                df = pd.read_csv(power_file)
+                df = pd.read_csv(power_file, header = None)
             elif power_file.lower().endswith(('.xlsx', '.xls')):
-                df = pd.read_excel(power_file)
+                df = pd.read_excel(power_file, header=None)
             else:
                 # Try CSV as default
-                df = pd.read_csv(power_file)
+                df = pd.read_csv(power_file,header=None)
             
             # Expect first column to be time, second to be power percentage
             if df.shape[1] < 2:
@@ -138,7 +145,10 @@ class LaserHeatingSimulation(SimulationBase):
             times = df.iloc[:, 0].values
             power_percentages = df.iloc[:, 1].values
             
-            # Validate data
+
+            times = pd.to_numeric(times, errors='coerce')
+            power_percentages = pd.to_numeric(power_percentages, errors='coerce')
+                # Validate data
             if len(times) == 0:
                 raise ValueError("Power file contains no data")
             
@@ -159,7 +169,7 @@ class LaserHeatingSimulation(SimulationBase):
 
             self.power_times = times
             self.power_interpolator = interp1d(
-                scaled_times, power_percentages, 
+                times, power_percentages,  #scaled_times old value
                 kind='linear', 
                 bounds_error=False, 
                 fill_value=(power_percentages[0], power_percentages[-1])
@@ -284,8 +294,9 @@ class LaserHeatingSimulation(SimulationBase):
                 raise RuntimeError("Failed to initialize mesh handler")
             
             # Create mesh using mesh handler
-            self.mesh = self.mesh_handler.create_mesh(None)
-            
+            # self.mesh = self.mesh_handler.create_mesh(None)
+            self.mesh = self.mesh_handler.create_statisic_optimized_mesh(None)
+
             # NOW initialize time solver with the mesh
             if self.time_solver is None:
                 self.time_solver = TimeSteppingSolver(self.parameters, None, self.mesh_handler)
@@ -339,21 +350,23 @@ class LaserHeatingSimulation(SimulationBase):
             self.dt_param = df.Constant(self.parameters['dt'])
             self.time_solver.set_dt_param(self.dt_param)
 
-
-            self.F = (rho*cp*(self.u-self.u_n)*v + self.dt_param*k*df.dot(df.grad(self.u),df.grad(v)))*df.dx
-
             # Radiation
             emissivity = self.parameters['emissivity']
             sigma = self.parameters['stefan_boltzmann']
-            
-            self.F += self.dt_param * emissivity * sigma * (self.u**4 - T_ambient**4) * v * df.ds
 
-            # Add convective boundary term
-            if h_conv > 0:
-                self.F += self.dt_param*h_conv*(self.u-T_ambient)*v*df.ds
+            # Check if using temperature-dependent properties
+            if self.parameters.get('use_temperature_dependent_properties', False):
+                print("Setting up temperature-dependent variational form...")
+                self.setup_temperature_dependent_form(v, T_ambient, h_conv, emissivity, sigma)
+            else:
+                print("Using constant material properties...")
+                # Use constant properties (your existing code)
+                self.F = (rho*cp*(self.u-self.u_n)*v + self.dt_param*k*df.dot(df.grad(self.u),df.grad(v)))*df.dx
+                self.F += self.dt_param * emissivity * sigma * (self.u**4 - T_ambient**4) * v * df.ds
+                if h_conv > 0:
+                    self.F += self.dt_param*h_conv*(self.u-T_ambient)*v*df.ds
+                self.F -= self.dt_param*self.laser_source*v*df.dx
 
-            # Add heat source term
-            self.F -= self.dt_param*self.laser_source*v*df.dx
 
             self.solver_params = {
                 'nonlinear_solver': 'newton',
@@ -370,37 +383,83 @@ class LaserHeatingSimulation(SimulationBase):
     
         except Exception as e:
             raise RuntimeError(f"Failed to set up simulation: {str(e)}")
-
-
-    def recreate_variational_form_after_refinement(self):
-        """Recreate variational form after mesh refinement"""
-        # Material properties
-        k = self.parameters['k']
-        rho = self.parameters['rho']
-        cp = self.parameters['cp']
-        h_conv = self.parameters['convection_coeff']
-        T_ambient = self.parameters['T_ambient']
-        emissivity = self.parameters['emissivity']
-        sigma = self.parameters['stefan_boltzmann']
         
-        # Test function
-        v = df.TestFunction(self.V)
+    def setup_temperature_dependent_form(self, v, T_ambient, h_conv, emissivity, sigma):
+        """Setup variational form with temperature-dependent properties"""
+        # Create functions to hold the spatially-varying properties
+        self.k_func = df.Function(self.V)
+        self.rho_func = df.Function(self.V)
+        self.cp_func = df.Function(self.V)
         
-        # Recreate the variational form with updated function space
-        self.F = (rho*cp*(self.u-self.u_n)*v + self.dt_param*k*df.dot(df.grad(self.u),df.grad(v)))*df.dx
+        # Initialize with base values
+        k_base = self.parameters['k_base']
+        rho_base = self.parameters['rho_base']
+        cp_base = self.parameters['cp_base']
+        
+        self.k_func.assign(df.Constant(k_base))
+        self.rho_func.assign(df.Constant(rho_base))
+        self.cp_func.assign(df.Constant(cp_base))
+        
+        # Variational form with spatially-varying properties
+        self.F = (self.rho_func * self.cp_func * (self.u - self.u_n) * v + 
+                self.dt_param * self.k_func * df.dot(df.grad(self.u), df.grad(v))) * df.dx
+        
+        # Boundary terms remain the same
         self.F += self.dt_param * emissivity * sigma * (self.u**4 - T_ambient**4) * v * df.ds
-
         if h_conv > 0:
-            self.F += self.dt_param*h_conv*(self.u-T_ambient)*v*df.ds
+            self.F += self.dt_param * h_conv * (self.u - T_ambient) * v * df.ds
+        self.F -= self.dt_param * self.laser_source * v * df.dx
+
+    def update_material_properties(self):
+        """Update material properties based on current temperature field"""
+        if not self.parameters.get('use_temperature_dependent_properties', False):
+            return
         
-        self.F -= self.dt_param*self.laser_source*v*df.dx
+        # Get temperature values at all nodes
+        temp_values = self.u.vector().get_local()
         
+        # Calculate properties at each node
+        k_values = np.zeros_like(temp_values)
+        rho_values = np.zeros_like(temp_values)
+        cp_values = np.zeros_like(temp_values)
+        
+        for i, T in enumerate(temp_values):
+            props = self.get_material_properties(T)
+            k_values[i] = props['k']
+            rho_values[i] = props['rho']
+            cp_values[i] = props['cp']
+        
+        # Update the property functions
+        self.k_func.vector().set_local(k_values)
+        self.rho_func.vector().set_local(rho_values)
+        self.cp_func.vector().set_local(cp_values)
+        
+        # Apply changes
+        self.k_func.vector().apply('insert')
+        self.rho_func.vector().apply('insert')
+        self.cp_func.vector().apply('insert')
+        
+        # Print some debug info
+        # avg_k = np.mean(k_values)
+        # avg_rho = np.mean(rho_values) 
+        # avg_cp = np.mean(cp_values)
+        # print(f"Updated properties - avg k: {avg_k:.1f}, avg rho: {avg_rho:.1f}, avg cp: {avg_cp:.1f}")
+        min_temp = np.min(temp_values)
+        max_temp = np.max(temp_values)
+        avg_k = np.mean(k_values)
+        avg_rho = np.mean(rho_values)
+        avg_cp = np.mean(cp_values)
+        
+        # Calculate new thermal diffusivity
+        avg_alpha = avg_k / (avg_rho * avg_cp)
+        
+        print(f"TEMP-DEP PROPS: T_range=[{min_temp:.1f}-{max_temp:.1f}]K, "
+            f"avg_k={avg_k:.1f}, avg_rho={avg_rho:.1f}, avg_cp={avg_cp:.1f}, "
+            f"α={avg_alpha:.2e} m²/s")
+
     def update_laser_source(self, t_real):
         """Update laser heat source for current time step"""
-        if self.power_interpolator is not None:
-            current_power = self.power_interpolator(t_real)
-        else:
-            current_power = self.parameters['peak_laser_power']
+      
 
         # Laser is stationary at center of mesh
         L = self.parameters['length']
@@ -412,11 +471,13 @@ class LaserHeatingSimulation(SimulationBase):
         laser_z = H      # Top surface
         
         # Laser parameters
-        rt = self.get_scaled_time(t_real)
         if self.power_interpolator is not None:
-            power = self.get_laser_power(rt)
+            current_power = self.power_interpolator(t_real)
+            print(f"DEBUG: Using interpolator at t_real={t_real:.4f}s, power={current_power:.1f}W")
         else:
-            power = self.parameters['peak_laser_power']
+            current_power = self.parameters['peak_laser_power']
+            print(f"DEBUG: Using constant power={current_power:.1f}W")
+
 
         radius = self.parameters['beam_radius']
         absorptivity = self.parameters['absorptivity']
@@ -455,12 +516,12 @@ class LaserHeatingSimulation(SimulationBase):
                 return ()
                 
         # Create and interpolate laser source
-        laser_expr = LaserSource(laser_x, laser_y, laser_z, power, radius, absorptivity, degree=2)
+        laser_expr = LaserSource(laser_x, laser_y, laser_z, current_power, radius, absorptivity, degree=2)
         self.laser_source.interpolate(laser_expr)
 
         print(f"Laser at ({laser_x*1000:.2f}, {laser_y*1000:.2f}, {laser_z*1000:.2f}) mm")
         print(f"Mesh bounds: (0, 0, 0) to ({L*1000:.2f}, {W*1000:.2f}, {H*1000:.2f}) mm")
-        print(f"Power: {power:.1f}W, Radius: {radius*1000:.2f}mm, Absorptivity: {absorptivity}")
+        print(f"Power: {current_power:.1f}W, Radius: {radius*1000:.2f}mm, Absorptivity: {absorptivity}")
         
     def get_laser_position(self, t):
         """Get laser position at time t (stationary at center) Could be changed to move the laser"""
@@ -468,16 +529,78 @@ class LaserHeatingSimulation(SimulationBase):
         W = self.parameters['width']
         return L / 2, W / 2  # Always at center
 
+    def _get_custom_equation_properties(self, T):
+        """Calculate properties using custom equations"""
+        base_vars = {
+            'k_base': self.parameters['k_base'],
+            'rho_base': self.parameters['rho_base'],
+            'cp_base': self.parameters['cp_base'],
+        }
+        
+        # Initialize parsers if not already done
+        if not hasattr(self, '_equation_parsers'):
+            self._equation_parsers = {}
+            
+            for prop in ['k', 'rho', 'cp']:
+                equation_key = f'{prop}_equation'
+                if equation_key in self.parameters:
+                    try:
+                        self._equation_parsers[prop] = EquationParser(
+                            self.parameters[equation_key], 
+                            base_vars
+                        )
+                    except Exception as e:
+                        print(f"Warning: Invalid {prop} equation: {e}")
+                        # Fall back to constant value
+                        self._equation_parsers[prop] = None
+        
+        # Evaluate equations
+        result = {}
+        for prop in ['k', 'rho', 'cp']:
+            if prop in self._equation_parsers and self._equation_parsers[prop] is not None:
+                try:
+                    result[prop] = self._equation_parsers[prop].evaluate(T=T)
+                except Exception as e:
+                    print(f"Warning: Error evaluating {prop} equation at T={T}: {e}")
+                    # Fall back to base value
+                    result[prop] = base_vars[f'{prop}_base']
+            else:
+                # Use base value if no equation
+                result[prop] = base_vars[f'{prop}_base']
+        
+        return result
+
+    def get_material_properties(self, temperature):
+        """Get material properties at given temperature"""
+        if not self.parameters['use_temperature_dependent_properties']:
+            return {
+                'k': self.parameters['k'],
+                'rho': self.parameters['rho'],
+                'cp': self.parameters['cp']
+            }
+        
+        variation_type = self.parameters['property_variation_type']
+        
+        if variation_type == 'linear':
+            return self._get_linear_properties(temperature)
+        elif variation_type == 'polynomial':
+            return self._get_polynomial_properties(temperature)
+        elif variation_type == 'piecewise':
+            return self._get_piecewise_properties(temperature)
+        elif variation_type == 'from_file':
+            return self._get_file_properties(temperature)
+        elif variation_type == 'custom_equation':
+            return self._get_custom_equation_properties(temperature)
+        else:
+            raise ValueError(f"Unknown property variation type: {variation_type}")
+
     def run(self, progress_callback=None, use_parallel=True):
         """Run the 3D laser heating simulation with optional parallel processing"""
         if not FENICS_AVAILABLE:
             return self._run_fallback(progress_callback)
         
-        
         rank = 0
     
- # No MPI available, use defaults
-
         # Validate parameters
         errors = self.validate_parameters()
         if errors:
@@ -508,7 +631,10 @@ class LaserHeatingSimulation(SimulationBase):
             times = []
             max_temperatures = []
             temperature_fields = []
-            
+            avg_surface_temperatures = []
+            surface_temp_stats_list = []
+
+
             # Time stepping loop
             t_scaled = 0
             step = 0
@@ -537,7 +663,9 @@ class LaserHeatingSimulation(SimulationBase):
                 # Update time step using time solver
                 self.time_solver.update_dt(dt_scaled)
                 t_real = self.get_real_time(t_scaled)
-                self.update_laser_source(t_scaled)
+
+                t_real = self.get_real_time(t_scaled)
+                self.update_laser_source(t_real)
                 
                 # Solve time step using time solver
                 success, error = self.time_solver.solve_time_step(self.F, self.u, self.bcs, step, t_scaled)
@@ -547,68 +675,34 @@ class LaserHeatingSimulation(SimulationBase):
                         print(error)
                     break
 
+                if self.parameters.get('use_temperature_dependent_properties', False):
+                    self.update_material_properties()
+
                 current_max_temp = self.u.vector().max()
+                
+                surface_temp_stats = self.get_average_surface_temperature_in_laser_spot()
+                current_avg_surface_temp = surface_temp_stats['avg_temp']
+                
                 prev_max_temp = current_max_temp
 
-                # Check for mesh refinement using mesh handler
-                if self.time_solver.should_refine_mesh(step):
-                    try:
-                        # Get laser criteria for refinement
-                        laser_criteria = {
-                            'laser_position': self.get_laser_position(t_scaled),
-                            'laser_radius': self.parameters['beam_radius'],
-                            'T_melt': self.parameters['T_melt'],
-                            'current_time': t_scaled
-                        }
-                        
-                        mesh_changed = self.mesh_handler.adaptive_mesh_refinement(self.u, laser_criteria)
-                        if mesh_changed:
-                            print(f"Mesh refined at step {step}, time {t_scaled:.4f}s")
-                            
-                            print("DEBUG: About to update function space...")
-                            # Update function space and recreate variational form
-                            self.V = self.mesh_handler.get_function_space()
-                            print("DEBUG: Function space updated")
-                            
-                            print("DEBUG: About to update mesh reference...")
-                            self.mesh = self.mesh_handler.mesh  # Update mesh reference
-                            print("DEBUG: Mesh reference updated")
-                            
-                            print("DEBUG: About to recreate variational form...")
-                            self.recreate_variational_form_after_refinement()
-                            print("DEBUG: Variational form recreated")
-                            
-                            print("DEBUG: About to update laser source...")
-                            self.update_laser_source(t_scaled)
-                            print("DEBUG: Laser source updated")
-                            
-                    except Exception as e:
-                        print(f"Post-refinement error: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # Continue without the updates
-                    if step % 5 == 0 or step < 20:  # Report frequently at start, then every 5 steps
-                        if rank == 0:
-                            print(f"Step {step:4d}, Real Time: {t_real:.4f}s, "
-                                f"Scaled Time: {t_scaled:.6f}s, Max Temp: {current_max_temp:.1f}K")
-
-                # Store results
-                # if self.time_solver.should_output_results(step,t_real):
-                #     times.append(t_real)  # Store real time
-                #     max_temperatures.append(current_max_temp)
-                #     temp_values = self.u.vector().get_local()
-                #     temperature_fields.append(temp_values.tolist())
-
-                #     if progress_callback and rank == 0:
-                #         real_progress = (t_real / self.parameters['total_time']) * 100
-                #         progress_callback(real_progress)
-                #         print(f"Progress: {real_progress:.1f}% (t_real={t_real:.4f}s)")
+        
+                if step % 5 == 0 or step < 20:  # Report frequently at start, then every 5 steps
+                    if rank == 0:
+                         print(f"Step {step:4d}, Real Time: {t_real:.4f}s, "
+                                f"Max Temp: {current_max_temp:.1f}K, "
+                                f"Avg Surface (laser spot): {current_avg_surface_temp:.1f}K")
+                                
 
                 if self.should_output_at_time(t_real, times):
                     times.append(t_real)  # Store real time
                     max_temperatures.append(current_max_temp)
                     temp_values = self.u.vector().get_local()
                     temperature_fields.append(temp_values.tolist())
+
+                    surface_stats = self.get_average_surface_temperature_in_laser_spot()
+                    avg_surface_temperatures.append(surface_stats['avg_temp'])
+                    surface_temp_stats_list.append(surface_stats)
+
 
                     if progress_callback:
                         real_progress = (t_real / self.parameters['total_time']) * 100
@@ -628,6 +722,8 @@ class LaserHeatingSimulation(SimulationBase):
                 results = {
                     'times': times,
                     'max_temperatures': max_temperatures,
+                    'avg_surface_temperatures': avg_surface_temperatures,  # Add this
+                    'surface_temp_stats': surface_temp_stats_list, 
                     'melt_pool_volumes': melt_volumes,
                     'heat_fluxes': heat_fluxes,
                     'temperature_fields': temperature_fields,
@@ -712,6 +808,94 @@ class LaserHeatingSimulation(SimulationBase):
             'temperature': temp_field
         }
         
+    def get_average_surface_temperature_in_laser_spot(self, temp_function=None):
+        """
+        Calculate average temperature on the surface within the laser spot radius
+        
+        Args:
+            temp_function: Temperature function to evaluate (uses self.u if None)
+        
+        Returns:
+            dict: Contains average temperature, number of points, and other statistics
+        """
+        if temp_function is None:
+            temp_function = self.u
+        
+        if temp_function is None:
+            return {'avg_temp': self.parameters['T_ambient'], 'num_points': 0}
+        
+        # Get laser parameters
+        L = self.parameters['length']
+        W = self.parameters['width'] 
+        H = self.parameters['height']
+        laser_radius = self.parameters['beam_radius']
+        
+        # Laser position (center of surface)
+        laser_x = L / 2
+        laser_y = W / 2
+        laser_z = H  # Top surface
+        
+        # Create sampling points within the laser spot
+        n_radial = 10  # Number of radial divisions
+        n_angular = 16  # Number of angular divisions
+        
+        temperatures = []
+        valid_points = 0
+        
+        # Sample at center point
+        try:
+            center_point = df.Point(laser_x, laser_y, laser_z)
+            center_temp = temp_function(center_point)
+            temperatures.append(center_temp)
+            valid_points += 1
+        except RuntimeError:
+            pass
+        
+        # Sample in concentric circles
+        for r_idx in range(1, n_radial + 1):
+            radius = (r_idx / n_radial) * laser_radius*2 #The two is a multiplier for larger radius
+            
+            for theta_idx in range(n_angular):
+                theta = (theta_idx / n_angular) * 2 * np.pi
+                
+                # Calculate point coordinates
+                x = laser_x + radius * np.cos(theta)
+                y = laser_y + radius * np.sin(theta)
+                z = laser_z
+                
+                # Check if point is within mesh bounds
+                if (0 <= x <= L) and (0 <= y <= W):
+                    try:
+                        point = df.Point(x, y, z)
+                        temp = temp_function(point)
+                        temperatures.append(temp)
+                        valid_points += 1
+                    except RuntimeError:
+                        # Point outside mesh domain
+                        continue
+        
+        if valid_points == 0:
+            return {
+                'avg_temp': self.parameters['T_ambient'],
+                'min_temp': self.parameters['T_ambient'],
+                'max_temp': self.parameters['T_ambient'],
+                'num_points': 0,
+                'std_temp': 0.0,
+                'sampling_radius_mm': laser_radius * 2 * 1000  # 2x radius in mm
+
+            }
+        
+        temperatures = np.array(temperatures)
+        
+        return {
+            'avg_temp': np.mean(temperatures),
+            'min_temp': np.min(temperatures),
+            'max_temp': np.max(temperatures),
+            'num_points': valid_points,
+            'std_temp': np.std(temperatures),
+            'laser_radius_mm': laser_radius * 1000 *2
+        }    
+    
     def plot_results(self, results, axes):
             """
             Plots for 3D FEniCS simulation. Heat maps of surface and 
@@ -740,9 +924,14 @@ class LaserHeatingSimulation(SimulationBase):
                     im = ax1.contourf(X*1000, Y*1000, surface_temp, levels=50, cmap='hot')
                     
                     # Add colorbar
-                    plt.colorbar(im, ax=ax1, label='Temperature (K)', shrink=0.8)
-                    
-                    # Add melting contour
+                    try:
+                        cbar = plt.colorbar(im, ax=ax1, label='Temperature (K)', shrink=0.8)
+                        if colorbar_list is not None:
+                            self.colorbars.append(cbar)
+                    except Exception as e:
+                        print(f"Warning: Could not create colorbar: {e}")
+                   
+                   # Add melting contour
                     T_melt = self.parameters['T_melt']
                     if np.max(surface_temp) > T_melt:
                         ax1.contour(X*1000, Y*1000, surface_temp, levels=[T_melt], 
@@ -770,13 +959,19 @@ class LaserHeatingSimulation(SimulationBase):
                 ax3.set_title('Y-Z Cross-Section - No Data Available')
 
             # Plot 4: Temperature vs time at laser spot
+            # In plot_results(), modify Plot 4 to show both temperatures:
             ax4.clear()
             if 'times' in results and 'max_temperatures' in results:
                 ax4.plot(results['times'], results['max_temperatures'], 'r-', linewidth=2, label='Max Temperature')
                 
+                # Add surface temperature plot:
+                if 'avg_surface_temperatures' in results:
+                    ax4.plot(results['times'], results['avg_surface_temperatures'], 'b-', linewidth=2, 
+                            label='Avg Surface (Laser Spot)')
+                
                 ax4.set_xlabel('Time (s)')
                 ax4.set_ylabel('Temperature (K)')
-                ax4.set_title('Maximum Temperature vs Time')
+                ax4.set_title('Temperature vs Time')
                 ax4.grid(True, alpha=0.3)
                 ax4.legend()
 
@@ -960,3 +1155,129 @@ class LaserHeatingSimulation(SimulationBase):
         if hasattr(self, 'bcs'):
             del self.bcs
 
+
+class EquationParser:
+    """Safe equation parser for temperature-dependent properties"""
+    
+    # Allowed operations and functions
+    ALLOWED_OPS = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Pow: operator.pow,
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+    }
+    
+    ALLOWED_FUNCTIONS = {
+        'sin': math.sin,
+        'cos': math.cos,
+        'tan': math.tan,
+        'exp': math.exp,
+        'log': math.log,
+        'log10': math.log10,
+        'sqrt': math.sqrt,
+        'abs': abs,
+        'min': min,
+        'max': max,
+        'pow': pow,
+        # NumPy functions for array operations
+        'np_sin': np.sin,
+        'np_cos': np.cos,
+        'np_tan': np.tan,
+        'np_exp': np.exp,
+        'np_log': np.log,
+        'np_sqrt': np.sqrt,
+        'np_abs': np.abs,
+    }
+    
+    ALLOWED_CONSTANTS = {
+        'pi': math.pi,
+        'e': math.e,
+    }
+    
+    def __init__(self, equation_str, variables):
+        """
+        Initialize parser with equation string and available variables
+        
+        Args:
+            equation_str: String equation like "k_base * (1 + 0.001 * T)"
+            variables: Dict of variable names and values like {'T': 500, 'k_base': 120}
+        """
+        self.equation_str = equation_str
+        self.variables = variables
+        self.compiled_expr = None
+        self._compile_equation()
+    
+    def _compile_equation(self):
+        """Compile the equation for faster evaluation"""
+        try:
+            # Parse the equation
+            tree = ast.parse(self.equation_str, mode='eval')
+            self.compiled_expr = compile(tree, '<string>', 'eval')
+        except SyntaxError as e:
+            raise ValueError(f"Invalid equation syntax: {self.equation_str}\nError: {e}")
+    
+    def evaluate(self, **kwargs):
+        """Evaluate the equation with given variable values"""
+        # Combine default variables with provided kwargs
+        eval_vars = {**self.variables, **kwargs}
+        
+        # Add allowed functions and constants
+        eval_vars.update(self.ALLOWED_FUNCTIONS)
+        eval_vars.update(self.ALLOWED_CONSTANTS)
+        
+        try:
+            # Evaluate the compiled expression
+            result = eval(self.compiled_expr, {"__builtins__": {}}, eval_vars)
+            return float(result)
+        except Exception as e:
+            raise ValueError(f"Error evaluating equation '{self.equation_str}' with variables {kwargs}: {e}")
+    
+    def evaluate_array(self, T_array):
+        """Evaluate equation for an array of temperatures"""
+        if isinstance(T_array, (list, tuple)):
+            T_array = np.array(T_array)
+        
+        # For array operations, we need to use numpy functions
+        eval_vars = {**self.variables}
+        eval_vars.update(self.ALLOWED_FUNCTIONS)
+        eval_vars.update(self.ALLOWED_CONSTANTS)
+        eval_vars['T'] = T_array
+        
+        # Replace math functions with numpy equivalents for array operations
+        equation_np = self.equation_str
+        replacements = {
+            'sin(': 'np_sin(',
+            'cos(': 'np_cos(',
+            'tan(': 'np_tan(',
+            'exp(': 'np_exp(',
+            'log(': 'np_log(',
+            'sqrt(': 'np_sqrt(',
+            'abs(': 'np_abs(',
+        }
+        
+        for old, new in replacements.items():
+            equation_np = equation_np.replace(old, new)
+        
+        try:
+            tree = ast.parse(equation_np, mode='eval')
+            compiled_expr = compile(tree, '<string>', 'eval')
+            result = eval(compiled_expr, {"__builtins__": {}}, eval_vars)
+            return np.array(result, dtype=float)
+        except Exception as e:
+            raise ValueError(f"Error evaluating equation '{equation_np}' for array: {e}")
+
+    @staticmethod
+    def validate_equation(equation_str, test_variables):
+        """Validate that an equation is safe and evaluates correctly"""
+        try:
+            parser = EquationParser(equation_str, test_variables)
+            # Test with sample values
+            result = parser.evaluate(T=500.0)
+            if not isinstance(result, (int, float)) or not math.isfinite(result):
+                raise ValueError("Equation must return a finite number")
+            return True, None
+        except Exception as e:
+            return False, str(e)
