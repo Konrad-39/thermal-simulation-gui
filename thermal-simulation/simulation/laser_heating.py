@@ -1,3 +1,4 @@
+# laser_heating.py
 """
 3D Laser heating simulation using FEniCS.
 Includes stationary heat source, phase change, and advanced heat transfer.
@@ -6,14 +7,16 @@ Includes stationary heat source, phase change, and advanced heat transfer.
 import numpy as np
 import matplotlib.pyplot as plt
 from . import SimulationBase
-import time
 from scipy.interpolate import interp1d
 import pandas as pd  
 from .Mesh import ThermalMesh
 from .timestep import TimeSteppingSolver
-import ast
-import operator
-import math
+from .equation_parser import EquationParser  # NEW IMPORT
+
+# Remove these imports (now in equation_parser.py):
+# import ast
+# import operator  
+# import math
 
 try:
     import dolfin as df
@@ -24,7 +27,25 @@ except ImportError:
     print("Warning: FEniCS not available. Using fallback implementation.")
 
 class LaserHeatingSimulation(SimulationBase):
-    """3D Laser heating simulation using FEniCS"""
+    """
+    3D Laser heating simulation using FEniCS with power scaling for computational efficiency.
+    
+    Features:
+    - Gaussian laser heat source with Beer-Lambert absorption
+    - Power scaling for accelerated thermal diffusion
+    - Temperature-dependent material properties (optional)
+    - Surface temperature analysis and pyrometer simulation
+    - Real-time adaptive time stepping
+    
+    Args:
+        None - uses default parameters, call set_parameters() to customize
+        
+    Example:
+        sim = LaserHeatingSimulation()
+        sim.set_parameters({'peak_laser_power': 500.0, 'time_scale_factor': 1000.0})
+        results = sim.run()
+        sim.plot_results(results, axes)
+    """
     
     def __init__(self):
         super().__init__()
@@ -34,55 +55,48 @@ class LaserHeatingSimulation(SimulationBase):
         self.time_solver = None
         self.colorbars = []
         self.default_parameters = {
-            # Material properties (need to set these to SiC)
+            # Material properties (SiC)
             'k': 120.0,           # Thermal conductivity W/m·K
-            'rho': 3200.0,       # Density kg/m³
-            'cp': 750.0,         # Specific heat J/kg·K
-            'T_ambient': 298.0,  # Ambient temperature K
-            'T_melt': 3103.0,    # Melting temperature K
-            'T_vaporization': 3134.0,  # Vaporization temperature K
-
-                # Temperature-dependent material properties
+            'rho': 3200.0,        # Density kg/m³
+            'cp': 750.0,          # Specific heat J/kg·K
+            'T_ambient': 298.0,   # Ambient temperature K
+            'T_melt': 3103.0,     # Melting temperature K
+            
+            # Temperature-dependent properties (advanced users)
             'use_temperature_dependent_properties': False,
-            'property_variation_type': 'custom_equation',  # 'linear', 'polynomial', 'piecewise', 'from_file', 'custom_equation'
-            
-            # Custom equation support
-            'k_equation': '1600/T**(0.85) + 400/T',      # Custom equation for k(T)
-            'rho_equation': 'rho_base*(1-(1.2*10**-5)*(T-298)',         # Custom equation for rho(T)
-            'cp_equation': '316.6 + 2.44*T-(1.65*10**5)/T**2',                    # Custom equation for cp(T)
-            
-            # Base values for equations (can be referenced in equations)
+            'property_variation_type': 'custom_equation',
+            'k_equation': '1600/T**(0.85) + 400/T',
+            'rho_equation': 'rho_base*(1-(1.2*10**-5)*(T-298))',
+            'cp_equation': '316.6 + 2.44*T-(1.65*10**5)/T**2',
             'k_base': 120.0,
             'rho_base': 3200.0,
             'cp_base': 750.0,
-            
             
             # Geometry (3D)
             'length': 0.008,      # m (x-direction)
             'width': 0.008,       # m (y-direction)
             'height': 0.0005,     # m (z-direction)
-            'mesh_resolution': 35,  # Elements per dimension
+            'mesh_resolution': 35,
             
-            # Laser parameters (stationary at center)
+            # Laser parameters
             'peak_laser_power': 300.0,    # W
-            'beam_radius': 0.0005,    # m
-            'absorptivity': 0.95,     # Absorption coefficient
-            'power_profile': 'constant', #constant or 'from_file'
-            'power_file': '',  #path to power file
+            'beam_radius': 0.0005,        # m
+            'absorptivity': 0.95,         # Absorption coefficient
+            'power_profile': 'constant',  # 'constant' or 'from_file'
+            'power_file': '',             # Path to power file
 
             # Heat transfer
-            'convection_coeff': 0.0,  # W/m²·K
-            'emissivity': 0.8,         # Surface emissivity
-            'stefan_boltzmann': 5.67e-8, # W/m²·K⁴
+            'convection_coeff': 0.0,      # W/m²·K
+            'emissivity': 0.8,            # Surface emissivity
+            'stefan_boltzmann': 5.67e-8,  # W/m²·K⁴
             
             # Simulation
-            'total_time': 10.0,     # s
-            'dt': 0.001,          # s
-            'output_interval': 10,  # steps
-            'time_scale_factor': 1.0, #Accelleration factor
+            'total_time': 10.0,           # s
+            'dt': 0.001,                  # s
+            'output_interval': 10,        # steps
+            'output_time_interval': 0.5,  # s
+            'time_scale_factor': 1.0,     # Acceleration factor
             'scale_thermal_properties': True,
-            'output_time_interval': 0.5  # Add this line
-
         }
 
         # Initialize power interpolator
@@ -224,13 +238,16 @@ class LaserHeatingSimulation(SimulationBase):
         if scale_factor == 1.0:
             return
         
-        # Store originals
+        # Store originals BEFORE scaling
         self.parameters['original_total_time'] = self.parameters['total_time']
         self.parameters['original_dt'] = self.parameters['dt']
+        self.parameters['original_k'] = self.parameters['k']      # IMPORTANT!
         self.parameters['original_rho'] = self.parameters['rho']
         self.parameters['original_cp'] = self.parameters['cp']
         
         print(f"=== SMART TIME SCALING: {scale_factor}x ===")
+        print(f"Stored original values: k={self.parameters['original_k']}, "
+            f"rho={self.parameters['original_rho']}, cp={self.parameters['original_cp']}")
         
         # Calculate original thermal diffusivity
         k = self.parameters['k']
@@ -247,8 +264,8 @@ class LaserHeatingSimulation(SimulationBase):
         print(f"New α: {alpha_new:.2e} m²/s (increased {alpha_new/alpha_original:.0f}x)")
         
         print(f"Simulating {self.parameters['total_time']}s with {scale_factor}x faster physics")
-        print("=" * 50) 
-   
+        print("=" * 50)
+
     def get_scaled_time(self, simulation_time):
         """Convert simulation time back to real time for output"""
         scale_factor = self.parameters.get('time_scale_factor', 1.0)
@@ -265,15 +282,28 @@ class LaserHeatingSimulation(SimulationBase):
 
     def should_output_at_time(self, current_time, existing_times):
         """Determine if we should output results at current time based on time interval"""
-        output_interval = self.parameters.get('output_time_interval', 0.5)
+        output_interval = self.parameters.get('output_time_interval', 0.1)  # Reduced to 0.1s
+        max_outputs = 1000  # Limit total outputs
         
         # Always output at t=0
         if len(existing_times) == 0:
             return True
         
+        # Don't exceed max outputs
+        if len(existing_times) >= max_outputs:
+            return False
+        
         # Check if enough time has passed since last output
         last_output_time = existing_times[-1] if existing_times else 0
-        return (current_time - last_output_time) >= output_interval
+        time_since_last = current_time - last_output_time
+        
+        # Output if interval passed OR if this is near the end of simulation
+        total_time = self.parameters.get('total_time', 10.0)
+        near_end = current_time > (total_time * 0.9)  # Last 10% of simulation
+        
+        should_output = (time_since_last >= output_interval) or near_end
+        
+        return should_output
 
     def setup_fenics_problem(self):
         """Setup 3D FEniCS mesh and function spaces"""
@@ -471,11 +501,13 @@ class LaserHeatingSimulation(SimulationBase):
         laser_z = H      # Top surface
         
         # Laser parameters
+        scale_factor = self.parameters.get('time_scale_factor', 1.0)
+
         if self.power_interpolator is not None:
-            current_power = self.power_interpolator(t_real)
+            current_power = self.power_interpolator(t_real)/np.sqrt(scale_factor)
             print(f"DEBUG: Using interpolator at t_real={t_real:.4f}s, power={current_power:.1f}W")
         else:
-            current_power = self.parameters['peak_laser_power']
+            current_power = self.parameters['peak_laser_power']/scale_factor
             print(f"DEBUG: Using constant power={current_power:.1f}W")
 
 
@@ -600,7 +632,7 @@ class LaserHeatingSimulation(SimulationBase):
             return self._run_fallback(progress_callback)
         
         rank = 0
-    
+
         # Validate parameters
         errors = self.validate_parameters()
         if errors:
@@ -619,26 +651,29 @@ class LaserHeatingSimulation(SimulationBase):
             # Get time stepping info
             time_info = self.time_solver.get_time_stepping_info()
             
-            # Get scaling parameters
-            scale_factor = self.parameters.get('time_scale_factor', 1.0)
-            
             # Time stepping parameters
             total_time = time_info['total_time']
             base_dt = time_info['dt']
             output_interval = time_info['output_interval']
 
-            # Storage for results
+            # Storage for results - Store RAW (uncorrected) data
             times = []
             max_temperatures = []
             temperature_fields = []
             avg_surface_temperatures = []
             surface_temp_stats_list = []
-
+            laser_spot_max_temps = []
+            laser_spot_pyrometer_temps = []
 
             # Time stepping loop
             t_scaled = 0
             step = 0
             prev_max_temp = self.parameters['T_ambient']
+
+            print(f"SIMULATION SETUP:")
+            print(f"  Total time: {self.parameters.get('total_time')} s")
+            print(f"  Output interval: {self.parameters.get('output_time_interval', 0.1)} s")
+            print(f"  Time scale factor: {self.parameters.get('time_scale_factor', 1.0)}")
 
             while self.get_real_time(t_scaled) < total_time:
                 if self.stop_requested:
@@ -664,7 +699,6 @@ class LaserHeatingSimulation(SimulationBase):
                 self.time_solver.update_dt(dt_scaled)
                 t_real = self.get_real_time(t_scaled)
 
-                t_real = self.get_real_time(t_scaled)
                 self.update_laser_source(t_real)
                 
                 # Solve time step using time solver
@@ -675,64 +709,79 @@ class LaserHeatingSimulation(SimulationBase):
                         print(error)
                     break
 
+                # NO CORRECTION HERE - just update properties if needed
                 if self.parameters.get('use_temperature_dependent_properties', False):
                     self.update_material_properties()
 
+                # Update current max temp (RAW, uncorrected)
                 current_max_temp = self.u.vector().max()
                 
+                # Calculate laser spot and surface temperatures (RAW)
+                laser_spot_stats = self.get_max_temperature_in_laser_spot()
+                laser_spot_max_temp = laser_spot_stats['max_temp']
+
                 surface_temp_stats = self.get_average_surface_temperature_in_laser_spot()
                 current_avg_surface_temp = surface_temp_stats['avg_temp']
-                
-                prev_max_temp = current_max_temp
+                laser_spot_pyrometer_temp = self.convert_to_pyrometer_reading(current_avg_surface_temp)
 
-        
-                if step % 5 == 0 or step < 20:  # Report frequently at start, then every 5 steps
+                # Progress reporting
+                if step % 5 == 0 or step < 20:
                     if rank == 0:
-                         print(f"Step {step:4d}, Real Time: {t_real:.4f}s, "
+                        print(f"Step {step:4d}, Real Time: {t_real:.4f}s, "
                                 f"Max Temp: {current_max_temp:.1f}K, "
-                                f"Avg Surface (laser spot): {current_avg_surface_temp:.1f}K")
-                                
+                                f"Avg Surface (laser spot): {current_avg_surface_temp:.1f}K, "
+                                f"Pyrometer: {laser_spot_pyrometer_temp:.1f}K")
 
+                # Store RAW (uncorrected) results
                 if self.should_output_at_time(t_real, times):
-                    times.append(t_real)  # Store real time
-                    max_temperatures.append(current_max_temp)
+                    # Get RAW temperature values
                     temp_values = self.u.vector().get_local()
+                    
+                    print(f"STORING RAW DATA: Step {step}, t_real={t_real:.4f}, max_temp={current_max_temp:.1f}K")
+                    
+                    # Store all RAW data
+                    times.append(t_real)
+                    max_temperatures.append(current_max_temp)
                     temperature_fields.append(temp_values.tolist())
-
-                    surface_stats = self.get_average_surface_temperature_in_laser_spot()
-                    avg_surface_temperatures.append(surface_stats['avg_temp'])
-                    surface_temp_stats_list.append(surface_stats)
-
-
+                    avg_surface_temperatures.append(current_avg_surface_temp)
+                    surface_temp_stats_list.append(surface_temp_stats)
+                    laser_spot_max_temps.append(laser_spot_max_temp)
+                    laser_spot_pyrometer_temps.append(laser_spot_pyrometer_temp)
+                    
+                    print(f"  Total data points stored: {len(times)}")
+                    
                     if progress_callback:
                         real_progress = (t_real / self.parameters['total_time']) * 100
                         progress_callback(real_progress)
-                        print(f"Progress: {real_progress:.1f}% (t_real={t_real:.4f}s)")
 
                 # Update for next step
                 self.u_n.assign(self.u)
                 prev_max_temp = current_max_temp
                 
-            print("Skipping post-processing for faster results...")
-            melt_volumes = [0.0] * len(times)
-            heat_fluxes = [0.0] * len(times)
+            print("Time stepping complete. Preparing results...")
+            print(f"Total time points stored: {len(times)}")
             
-            # Compile results (only on rank 0 for MPI)
-            if rank == 0 or comm is None:
-                results = {
-                    'times': times,
-                    'max_temperatures': max_temperatures,
-                    'avg_surface_temperatures': avg_surface_temperatures,  # Add this
-                    'surface_temp_stats': surface_temp_stats_list, 
-                    'melt_pool_volumes': melt_volumes,
-                    'heat_fluxes': heat_fluxes,
-                    'temperature_fields': temperature_fields,
-                    'final_temperature_function': self.u.copy(deepcopy=True),
-                    'parameters': self.parameters.copy()
-                }
-                return results
-            else:
-                return None
+            # Compile RAW results
+            raw_results = {
+                'times': times,
+                'max_temperatures': max_temperatures,
+                'temperature_fields': temperature_fields,
+                'avg_surface_temperatures': avg_surface_temperatures,
+                'surface_temp_stats': surface_temp_stats_list, 
+                'laser_spot_max_temperatures': laser_spot_max_temps,
+                'laser_spot_pyrometer_temperatures': laser_spot_pyrometer_temps,
+                # 'melt_pool_volumes': [0.0] * len(times),  # Placeholder
+                # 'heat_fluxes': [0.0] * len(times),  # Placeholder
+                'final_temperature_function': self.u.copy(), #deepcopy=Tru
+                'parameters': self.parameters.copy()
+            }
+
+            # Apply thermal correction post-processing
+            # print("Applying thermal corrections...")
+            # corrected_results = self.post_process_thermal_correction(raw_results)
+            
+            print("Simulation and post-processing complete!")
+            return raw_results
                 
         except Exception as e:
             if rank == 0:
@@ -807,7 +856,124 @@ class LaserHeatingSimulation(SimulationBase):
             'z': z,
             'temperature': temp_field
         }
+
+    def get_max_temperature_in_laser_spot(self, temp_function=None):
+        """
+        Calculate maximum temperature on the surface within the laser spot radius
         
+        Args:
+            temp_function: Temperature function to evaluate (uses self.u if None)
+        
+        Returns:
+            dict: Contains max temperature, location, and other statistics
+        """
+        if temp_function is None:
+            temp_function = self.u
+        
+        if temp_function is None:
+            return {'max_temp': self.parameters['T_ambient'], 'num_points': 0}
+        
+        # Get laser parameters
+        L = self.parameters['length']
+        W = self.parameters['width'] 
+        H = self.parameters['height']
+        laser_radius = self.parameters['beam_radius']
+        
+        # Laser position (center of surface)
+        laser_x = L / 2
+        laser_y = W / 2
+        laser_z = H  # Top surface
+        
+        # Create sampling points within the laser spot
+        n_radial = 50  # Number of radial divisions
+        n_angular = 50  # Number of angular divisions
+        
+        temperatures = []
+        valid_points = 0
+        
+        # Sample at center point
+        try:
+            center_point = df.Point(laser_x, laser_y, laser_z)
+            center_temp = temp_function(center_point)
+            temperatures.append(center_temp)
+            valid_points += 1
+        except RuntimeError:
+            pass
+        
+        # Sample in concentric circles
+        for r_idx in range(1, n_radial + 1):
+            radius = (r_idx / n_radial) * laser_radius * 2  # 2x radius for larger sampling area
+            
+            for theta_idx in range(n_angular):
+                theta = (theta_idx / n_angular) * 2 * np.pi
+                
+                # Calculate point coordinates
+                x = laser_x + radius * np.cos(theta)
+                y = laser_y + radius * np.sin(theta)
+                z = laser_z
+                
+                # Check if point is within mesh bounds
+                if (0 <= x <= L) and (0 <= y <= W):
+                    try:
+                        point = df.Point(x, y, z)
+                        temp = temp_function(point)
+                        temperatures.append(temp)
+                        valid_points += 1
+                    except RuntimeError:
+                        # Point outside mesh domain
+                        continue
+        
+        if valid_points == 0:
+            return {
+                'max_temp': self.parameters['T_ambient'],
+                'min_temp': self.parameters['T_ambient'],
+                'avg_temp': self.parameters['T_ambient'],
+                'num_points': 0,
+                'std_temp': 0.0,
+                'sampling_radius_mm': laser_radius * 2 * 1000
+            }
+        
+        temperatures = np.array(temperatures)
+        
+        return {
+            'max_temp': np.max(temperatures),
+            'min_temp': np.min(temperatures),
+            'avg_temp': np.mean(temperatures),
+            'num_points': valid_points,
+            'std_temp': np.std(temperatures),
+            'sampling_radius_mm': laser_radius * 2 * 1000
+        }
+        
+    def convert_to_pyrometer_reading(self, actual_temp, surface_emissivity=None):
+        """
+        Convert actual temperature to pyrometer reading assuming black body
+        
+        Args:
+            actual_temp: Actual surface temperature (K)
+            surface_emissivity: Surface emissivity (uses parameter if None)
+        
+        Returns:
+            pyrometer_temp: Temperature the pyrometer would display (K)
+        """
+        if surface_emissivity is None:
+            surface_emissivity = self.parameters['emissivity']
+        
+        sigma = self.parameters['stefan_boltzmann']
+        T_ambient = self.parameters['T_ambient']
+        
+        # Calculate actual radiated power per unit area
+        actual_radiated_power = surface_emissivity * sigma * (actual_temp**4 - T_ambient**4)
+        
+        # Calculate what temperature a black body would need to emit this power
+        # For black body: P = σ(T^4 - T_ambient^4)
+        if actual_radiated_power <= 0:
+            return T_ambient
+        
+        pyrometer_temp_4th = (actual_radiated_power / sigma) + T_ambient**4
+        pyrometer_temp = pyrometer_temp_4th**(1/4)
+        
+        return pyrometer_temp
+
     def get_average_surface_temperature_in_laser_spot(self, temp_function=None):
         """
         Calculate average temperature on the surface within the laser spot radius
@@ -836,8 +1002,8 @@ class LaserHeatingSimulation(SimulationBase):
         laser_z = H  # Top surface
         
         # Create sampling points within the laser spot
-        n_radial = 10  # Number of radial divisions
-        n_angular = 16  # Number of angular divisions
+        n_radial = 100  # Number of radial divisions
+        n_angular = 100  # Number of angular divisions
         
         temperatures = []
         valid_points = 0
@@ -853,7 +1019,7 @@ class LaserHeatingSimulation(SimulationBase):
         
         # Sample in concentric circles
         for r_idx in range(1, n_radial + 1):
-            radius = (r_idx / n_radial) * laser_radius*2 #The two is a multiplier for larger radius
+            radius = (r_idx / n_radial) * laser_radius*10*4 #The two is a multiplier for larger radius
             
             for theta_idx in range(n_angular):
                 theta = (theta_idx / n_angular) * 2 * np.pi
@@ -881,7 +1047,7 @@ class LaserHeatingSimulation(SimulationBase):
                 'max_temp': self.parameters['T_ambient'],
                 'num_points': 0,
                 'std_temp': 0.0,
-                'sampling_radius_mm': laser_radius * 2 * 1000  # 2x radius in mm
+                'sampling_radius_mm': laser_radius * 20 * 1000  # 2x radius in mm
 
             }
         
@@ -893,45 +1059,45 @@ class LaserHeatingSimulation(SimulationBase):
             'max_temp': np.max(temperatures),
             'num_points': valid_points,
             'std_temp': np.std(temperatures),
-            'laser_radius_mm': laser_radius * 1000 *2
+            'laser_radius_mm': laser_radius * 1000 *20
         }    
     
     def plot_results(self, results, axes):
-            """
-            Plots for 3D FEniCS simulation. Heat maps of surface and 
-            cross section thermal gradients, average temperature in the laser spot size
-            """
-            ax1, ax2, ax3, ax4 = axes
-            
-            # Get geometry parameters
-            L = self.parameters['length']
-            W = self.parameters['width']
-            H = self.parameters['height']
-            
-            # Use the stored final temperature function for spatial plots
-            final_temp_func = results.get('final_temperature_function', None)
-            
-            # Plot 1: Surface temperature heat map (laser side - top surface)
-            ax1.clear()
-            if hasattr(self, 'u') and self.u is not None:
+        """
+        Plots for 3D FEniCS simulation with power scaling.
+        Shows surface heat maps, cross-sections, and average laser spot temperatures.
+        """
+        ax1, ax2, ax3, ax4 = axes
+        
+        # Clear any existing colorbars
+        for cbar in self.colorbars:
+            try:
+                cbar.remove()
+            except:
+                pass
+        self.colorbars.clear()
+        
+        # Get final temperature function
+        final_temp_func = results.get('final_temperature_function', None)
+        
+        # Plot 1: Surface temperature heat map
+        ax1.clear()
+        if final_temp_func is not None:
+            try:
                 surface_data = self.extract_surface_temperature_from_function(final_temp_func)
-
                 if surface_data:
                     X, Y = surface_data['X'], surface_data['Y']
                     surface_temp = surface_data['temperature']
                     
-                    # Create color map
                     im = ax1.contourf(X*1000, Y*1000, surface_temp, levels=50, cmap='hot')
                     
-                    # Add colorbar
                     try:
                         cbar = plt.colorbar(im, ax=ax1, label='Temperature (K)', shrink=0.8)
-                        if colorbar_list is not None:
-                            self.colorbars.append(cbar)
-                    except Exception as e:
-                        print(f"Warning: Could not create colorbar: {e}")
-                   
-                   # Add melting contour
+                        self.colorbars.append(cbar)
+                    except:
+                        pass
+                    
+                    # Add melting contour if applicable
                     T_melt = self.parameters['T_melt']
                     if np.max(surface_temp) > T_melt:
                         ax1.contour(X*1000, Y*1000, surface_temp, levels=[T_melt], 
@@ -943,38 +1109,80 @@ class LaserHeatingSimulation(SimulationBase):
                     ax1.set_aspect('equal')
                 else:
                     ax1.set_title('Surface Temperature - No Data Available')
-            
-            # Plot 2: Cross-section through thickness (X-Z plane at centerline)
-            ax2.clear()
-            if final_temp_func is not None:
+            except Exception as e:
+                ax1.set_title('Surface Temperature - Error')
+        else:
+            ax1.set_title('Surface Temperature - No Temperature Function')
+        
+        # Plot 2: X-Z Cross-section
+        ax2.clear()
+        if final_temp_func is not None:
+            try:
                 self.plot_xz_cross_section_from_function(ax2, final_temp_func)
-            else:
-                ax2.set_title('X-Z Cross-Section - No Data Available')
+            except Exception as e:
+                ax2.set_title('X-Z Cross-Section - Error')
+        else:
+            ax2.set_title('X-Z Cross-Section - No Data Available')
 
-            # Plot 3: Cross-section through thickness (Y-Z plane at centerline)
-            ax3.clear()
-            if final_temp_func is not None:
+        # Plot 3: Y-Z Cross-section
+        ax3.clear()
+        if final_temp_func is not None:
+            try:
                 self.plot_yz_cross_section_from_function(ax3, final_temp_func)
-            else:
-                ax3.set_title('Y-Z Cross-Section - No Data Available')
+            except Exception as e:
+                ax3.set_title('Y-Z Cross-Section - Error')
+        else:
+            ax3.set_title('Y-Z Cross-Section - No Data Available')
 
-            # Plot 4: Temperature vs time at laser spot
-            # In plot_results(), modify Plot 4 to show both temperatures:
-            ax4.clear()
-            if 'times' in results and 'max_temperatures' in results:
-                ax4.plot(results['times'], results['max_temperatures'], 'r-', linewidth=2, label='Max Temperature')
-                
-                # Add surface temperature plot:
-                if 'avg_surface_temperatures' in results:
-                    ax4.plot(results['times'], results['avg_surface_temperatures'], 'b-', linewidth=2, 
-                            label='Avg Surface (Laser Spot)')
-                
-                ax4.set_xlabel('Time (s)')
-                ax4.set_ylabel('Temperature (K)')
-                ax4.set_title('Temperature vs Time')
-                ax4.grid(True, alpha=0.3)
-                ax4.legend()
-
+        # Plot 4: Temperature vs time - AVERAGE LASER SPOT TEMPERATURES
+        ax4.clear()
+        
+        if 'times' not in results or len(results['times']) == 0:
+            ax4.set_title('No Time Data Available')
+            return
+            
+        times = results['times']
+        
+        # Plot average surface temperatures in laser spot (main curve)
+        if 'avg_surface_temperatures' in results and len(results['avg_surface_temperatures']) == len(times):
+            ax4.plot(times, results['avg_surface_temperatures'], 'r-', 
+                    linewidth=3, label='Average Surface Temp (Laser Spot)')
+        
+        # Plot pyrometer reading (what you'd actually measure)
+        if 'laser_spot_pyrometer_temperatures' in results and len(results['laser_spot_pyrometer_temperatures']) == len(times):
+            ax4.plot(times, results['laser_spot_pyrometer_temperatures'], 'b-', 
+                    linewidth=2, label='Pyrometer Reading', linestyle='--')
+        
+        # Plot global max for reference (thinner line)
+        if 'max_temperatures' in results and len(results['max_temperatures']) == len(times):
+            ax4.plot(times, results['max_temperatures'], 'g-', 
+                    linewidth=1.5, label='Global Max Temperature', alpha=0.7)
+        
+        # Styling
+        ax4.set_xlabel('Time (s)', fontsize=12)
+        ax4.set_ylabel('Temperature (K)', fontsize=12)
+        ax4.grid(True, alpha=0.3)
+        ax4.legend()
+        
+        # Title with power scaling info
+        scale_factor = self.parameters.get('time_scale_factor', 1.0)
+        if scale_factor > 1:
+            ax4.set_title(f'Temperature vs Time (Power Scaled by √{scale_factor:.0f})', fontsize=11)
+        else:
+            ax4.set_title('Temperature vs Time', fontsize=11)
+        
+        # Add power info text box
+        current_power = self.parameters['peak_laser_power']
+        if scale_factor > 1:
+            scaled_power = current_power / np.sqrt(scale_factor)
+            power_info = f'Original Power: {current_power:.0f}W\nScaled Power: {scaled_power:.1f}W'
+        else:
+            power_info = f'Laser Power: {current_power:.0f}W'
+        
+        props = dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.8)
+        ax4.text(0.02, 0.98, power_info, transform=ax4.transAxes, fontsize=9,
+                verticalalignment='top', bbox=props)
+    
     def extract_surface_temperature_from_function(self, temp_function):
         """Extract temperature on the top surface using provided function"""
         if temp_function is None:
@@ -1015,6 +1223,7 @@ class LaserHeatingSimulation(SimulationBase):
     def plot_xz_cross_section_from_function(self, ax, temp_function):
         """Plot temperature cross-section in X-Z plane using provided function"""
         if temp_function is None:
+            ax.set_title('X-Z Cross-Section - No Data Available')
             return
         
         # Get geometry parameters
@@ -1046,7 +1255,11 @@ class LaserHeatingSimulation(SimulationBase):
         im = ax.contourf(X*1000, Z*1000, temp_xz, levels=50, cmap='hot')
         
         # Add colorbar
-        plt.colorbar(im, ax=ax, label='Temperature (K)', shrink=0.8)
+        try:
+            cbar = plt.colorbar(im, ax=ax, label='Temperature (K)', shrink=0.8)
+            self.colorbars.append(cbar)  # Store for cleanup
+        except Exception as e:
+            print(f"Warning: Could not create colorbar for XZ plot: {e}")
         
         # Add melting temperature contour
         T_melt = self.parameters['T_melt']
@@ -1063,6 +1276,7 @@ class LaserHeatingSimulation(SimulationBase):
     def plot_yz_cross_section_from_function(self, ax, temp_function):
         """Plot temperature cross-section in Y-Z plane using provided function"""
         if temp_function is None:
+            ax.set_title('Y-Z Cross-Section - No Data Available')
             return
         
         # Get geometry parameters
@@ -1094,7 +1308,11 @@ class LaserHeatingSimulation(SimulationBase):
         im = ax.contourf(Y*1000, Z*1000, temp_yz, levels=50, cmap='hot')
         
         # Add colorbar
-        plt.colorbar(im, ax=ax, label='Temperature (K)', shrink=0.8)
+        try:
+            cbar = plt.colorbar(im, ax=ax, label='Temperature (K)', shrink=0.8)
+            self.colorbars.append(cbar)  # Store for cleanup
+        except Exception as e:
+            print(f"Warning: Could not create colorbar for YZ plot: {e}")
         
         # Add melting temperature contour
         T_melt = self.parameters['T_melt']
@@ -1107,7 +1325,7 @@ class LaserHeatingSimulation(SimulationBase):
         ax.set_title(f'Y-Z Cross-Section at X={x_cross*1000:.1f} mm')
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
-
+   
     def validate_parameters(self):
         """Validate parameters specific to laser heating simulation"""
         errors = []
@@ -1154,130 +1372,4 @@ class LaserHeatingSimulation(SimulationBase):
             del self.F
         if hasattr(self, 'bcs'):
             del self.bcs
-
-
-class EquationParser:
-    """Safe equation parser for temperature-dependent properties"""
-    
-    # Allowed operations and functions
-    ALLOWED_OPS = {
-        ast.Add: operator.add,
-        ast.Sub: operator.sub,
-        ast.Mult: operator.mul,
-        ast.Div: operator.truediv,
-        ast.Pow: operator.pow,
-        ast.USub: operator.neg,
-        ast.UAdd: operator.pos,
-    }
-    
-    ALLOWED_FUNCTIONS = {
-        'sin': math.sin,
-        'cos': math.cos,
-        'tan': math.tan,
-        'exp': math.exp,
-        'log': math.log,
-        'log10': math.log10,
-        'sqrt': math.sqrt,
-        'abs': abs,
-        'min': min,
-        'max': max,
-        'pow': pow,
-        # NumPy functions for array operations
-        'np_sin': np.sin,
-        'np_cos': np.cos,
-        'np_tan': np.tan,
-        'np_exp': np.exp,
-        'np_log': np.log,
-        'np_sqrt': np.sqrt,
-        'np_abs': np.abs,
-    }
-    
-    ALLOWED_CONSTANTS = {
-        'pi': math.pi,
-        'e': math.e,
-    }
-    
-    def __init__(self, equation_str, variables):
-        """
-        Initialize parser with equation string and available variables
-        
-        Args:
-            equation_str: String equation like "k_base * (1 + 0.001 * T)"
-            variables: Dict of variable names and values like {'T': 500, 'k_base': 120}
-        """
-        self.equation_str = equation_str
-        self.variables = variables
-        self.compiled_expr = None
-        self._compile_equation()
-    
-    def _compile_equation(self):
-        """Compile the equation for faster evaluation"""
-        try:
-            # Parse the equation
-            tree = ast.parse(self.equation_str, mode='eval')
-            self.compiled_expr = compile(tree, '<string>', 'eval')
-        except SyntaxError as e:
-            raise ValueError(f"Invalid equation syntax: {self.equation_str}\nError: {e}")
-    
-    def evaluate(self, **kwargs):
-        """Evaluate the equation with given variable values"""
-        # Combine default variables with provided kwargs
-        eval_vars = {**self.variables, **kwargs}
-        
-        # Add allowed functions and constants
-        eval_vars.update(self.ALLOWED_FUNCTIONS)
-        eval_vars.update(self.ALLOWED_CONSTANTS)
-        
-        try:
-            # Evaluate the compiled expression
-            result = eval(self.compiled_expr, {"__builtins__": {}}, eval_vars)
-            return float(result)
-        except Exception as e:
-            raise ValueError(f"Error evaluating equation '{self.equation_str}' with variables {kwargs}: {e}")
-    
-    def evaluate_array(self, T_array):
-        """Evaluate equation for an array of temperatures"""
-        if isinstance(T_array, (list, tuple)):
-            T_array = np.array(T_array)
-        
-        # For array operations, we need to use numpy functions
-        eval_vars = {**self.variables}
-        eval_vars.update(self.ALLOWED_FUNCTIONS)
-        eval_vars.update(self.ALLOWED_CONSTANTS)
-        eval_vars['T'] = T_array
-        
-        # Replace math functions with numpy equivalents for array operations
-        equation_np = self.equation_str
-        replacements = {
-            'sin(': 'np_sin(',
-            'cos(': 'np_cos(',
-            'tan(': 'np_tan(',
-            'exp(': 'np_exp(',
-            'log(': 'np_log(',
-            'sqrt(': 'np_sqrt(',
-            'abs(': 'np_abs(',
-        }
-        
-        for old, new in replacements.items():
-            equation_np = equation_np.replace(old, new)
-        
-        try:
-            tree = ast.parse(equation_np, mode='eval')
-            compiled_expr = compile(tree, '<string>', 'eval')
-            result = eval(compiled_expr, {"__builtins__": {}}, eval_vars)
-            return np.array(result, dtype=float)
-        except Exception as e:
-            raise ValueError(f"Error evaluating equation '{equation_np}' for array: {e}")
-
-    @staticmethod
-    def validate_equation(equation_str, test_variables):
-        """Validate that an equation is safe and evaluates correctly"""
-        try:
-            parser = EquationParser(equation_str, test_variables)
-            # Test with sample values
-            result = parser.evaluate(T=500.0)
-            if not isinstance(result, (int, float)) or not math.isfinite(result):
-                raise ValueError("Equation must return a finite number")
-            return True, None
-        except Exception as e:
-            return False, str(e)
+ 
