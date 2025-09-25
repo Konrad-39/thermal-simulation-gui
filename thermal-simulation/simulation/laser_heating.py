@@ -499,6 +499,19 @@ class LaserHeatingSimulation(SimulationBase):
         laser_x = L / 2  # Center of mesh
         laser_y = W / 2  # Center of mesh
         laser_z = H      # Top surface
+
+        laser_x = self.parameters.get('laser_x_position', L / 2)  # Default to center
+        laser_y = self.parameters.get('laser_y_position', W / 2)  # Default to center
+        laser_z = H  # Keep at top surface
+        
+        # Validate laser position is within mesh bounds
+        if not (0 <= laser_x <= L):
+            print(f"Warning: laser_x_position {laser_x} is outside mesh bounds [0, {L}]. Clamping.")
+            laser_x = max(0, min(laser_x, L))
+        
+        if not (0 <= laser_y <= W):
+            print(f"Warning: laser_y_position {laser_y} is outside mesh bounds [0, {W}]. Clamping.")
+            laser_y = max(0, min(laser_y, W))
         
         # Laser parameters
         scale_factor = self.parameters.get('time_scale_factor', 1.0)
@@ -547,10 +560,13 @@ class LaserHeatingSimulation(SimulationBase):
             def value_shape(self):
                 return ()
                 
+        radius = self.parameters['beam_radius']
+        absorptivity = self.parameters['absorptivity']
+        
         # Create and interpolate laser source
         laser_expr = LaserSource(laser_x, laser_y, laser_z, current_power, radius, absorptivity, degree=2)
         self.laser_source.interpolate(laser_expr)
-
+        
         print(f"Laser at ({laser_x*1000:.2f}, {laser_y*1000:.2f}, {laser_z*1000:.2f}) mm")
         print(f"Mesh bounds: (0, 0, 0) to ({L*1000:.2f}, {W*1000:.2f}, {H*1000:.2f}) mm")
         print(f"Power: {current_power:.1f}W, Radius: {radius*1000:.2f}mm, Absorptivity: {absorptivity}")
@@ -559,7 +575,13 @@ class LaserHeatingSimulation(SimulationBase):
         """Get laser position at time t (stationary at center) Could be changed to move the laser"""
         L = self.parameters['length']
         W = self.parameters['width']
-        return L / 2, W / 2  # Always at center
+        
+        # Use custom positions if provided, otherwise use center
+        laser_x = self.parameters.get('laser_x_position', L / 2)
+        laser_y = self.parameters.get('laser_y_position', W / 2)
+
+        return laser_x, laser_y
+
 
     def _get_custom_equation_properties(self, T):
         """Calculate properties using custom equations"""

@@ -117,7 +117,9 @@ class ThermalSimulationGUI:
             ("Melting Temperature (K)", "T_melt", 3103.0),
             ("Ambient Temperature (K)", "T_ambient", 298.0),
             ("Emissivity", "emissivity", 0.9),
-            ("Stefan-Boltzmann Constant", "stefan_boltzmann", 5.67e-8)
+            ("Stefan-Boltzmann Constant", "stefan_boltzmann", 5.67e-8),
+            ("Laser X Position (m)", "laser_x", 0.004),  # Default to center
+            ("Laser Y Position (m)", "laser_y", 0.004)
         ]
         
         for i, (label, key, default) in enumerate(material_params):
@@ -593,13 +595,29 @@ class ThermalSimulationGUI:
                 ("Peak Laser Power (W)", "peak_laser_power", 300.0),
                 ("Beam Radius (m)", "beam_radius", 0.0005),
                 ("Absorptivity", "absorptivity", 0.9),
+                ("Laser X Position (m)", "laser_x_position", None),  # None will use center
+                ("Laser Y Position (m)", "laser_y_position", None), 
             ]
             
             for i, (label, key, default) in enumerate(params):
                 ttk.Label(self.boundary_frame, text=label).grid(row=i, column=0, sticky='w', padx=5, pady=5)
-                var = tk.DoubleVar(value=default)
-                entry = ttk.Entry(self.boundary_frame, textvariable=var, width=15)
-                entry.grid(row=i, column=1, padx=5, pady=5)
+        
+                if "position" in key:
+                    # Special handling for position fields
+                    var = tk.StringVar(value="center" if default is None else str(default))
+                    entry = ttk.Entry(self.boundary_frame, textvariable=var, width=15)
+                    entry.grid(row=i, column=1, padx=5, pady=5)
+                    
+                    # Add a note about using "center" keyword
+                    if i == 3:  # First position field
+                        note = ttk.Label(self.boundary_frame, text='(use "center" for auto-center)', 
+                                    font=('TkDefaultFont', 8))
+                        note.grid(row=i, column=2, sticky='w', padx=5)
+                else:
+                    var = tk.DoubleVar(value=default)
+                    entry = ttk.Entry(self.boundary_frame, textvariable=var, width=15)
+                    entry.grid(row=i, column=1, padx=5, pady=5)
+                
                 self.param_vars[key] = var
             
             # Add power profile option
@@ -737,17 +755,41 @@ class ThermalSimulationGUI:
         self.clear_results()
 
     def get_parameters(self):
-        """Get current parameters from GUI"""
+        """Collect all parameters from GUI"""
         params = {}
+        
+        # Get all parameters from param_vars
         for key, var in self.param_vars.items():
             try:
                 params[key] = var.get()
             except tk.TclError:
-                # Handle empty or invalid values
-                params[key] = 0.0 if isinstance(var, (tk.DoubleVar, tk.IntVar)) else ""
-        if hasattr(self, 'power_file_var'):
-            params['power_file'] = self.power_file_var.get()
+                pass
+        
+        # Handle laser position parameters (ADD THIS SECTION HERE)
+        if 'laser_x_position' in self.param_vars:
+            x_val = self.param_vars['laser_x_position'].get()
+            if x_val.lower() == "center":
+                # Don't set the parameter, let the simulation use default center
+                params.pop('laser_x_position', None)  # Remove if it was added
+            else:
+                try:
+                    params['laser_x_position'] = float(x_val)
+                except ValueError:
+                    messagebox.showerror("Error", "Invalid laser X position. Use a number or 'center'")
+                    return None  # Return None to indicate error
 
+        if 'laser_y_position' in self.param_vars:
+            y_val = self.param_vars['laser_y_position'].get()
+            if y_val.lower() == "center":
+                # Don't set the parameter, let the simulation use default center
+                params.pop('laser_y_position', None)  # Remove if it was added
+            else:
+                try:
+                    params['laser_y_position'] = float(y_val)
+                except ValueError:
+                    messagebox.showerror("Error", "Invalid laser Y position. Use a number or 'center'")
+                    return None  # Return None to indicate error
+        
         return params
 
     def validate_current_parameters(self):
