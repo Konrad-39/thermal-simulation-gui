@@ -40,21 +40,51 @@ class SimulationBase:
         raise NotImplementedError("Subclasses must implement plot_results method")
         
     def save_results(self, results, filename):
+        # """Save results to file"""
+        # # Convert numpy arrays to lists for JSON serialization
+        # def convert_numpy(obj):
+        #     if isinstance(obj, np.ndarray):
+        #         return obj.tolist()
+        #     elif hasattr(obj, '__class__') and 'dolfin' in str(obj.__class__):
+        #         return "FEniCS_Function_object_Not_Serializable"
+        #     elif isinstance(obj, dict):
+        #         return {k: convert_numpy(v) for k, v in obj.items()}
+        #     elif isinstance(obj, list):
+        #         return [convert_numpy(item) for item in obj]
+        #     else:
+        #         return obj
+        
+        # serializable_results = convert_numpy(results)
+        
+        # with open(filename, 'w') as f:
+        #     json.dump({
+        #         'parameters': self.parameters,
+        #         'results': serializable_results
+        #     }, f, indent=2)
+        # def save_results(self, results, filename):
         """Save results to file"""
-        # Convert numpy arrays to lists for JSON serialization
-        def convert_numpy(obj):
+        # Convert numpy arrays and FEniCS objects to serializable format
+        def convert_for_json(obj):
             if isinstance(obj, np.ndarray):
                 return obj.tolist()
             elif hasattr(obj, '__class__') and 'dolfin' in str(obj.__class__):
-                return "FEniCS_Function_object_Not_Serializable"
+                # Skip FEniCS function objects
+                return None
             elif isinstance(obj, dict):
-                return {k: convert_numpy(v) for k, v in obj.items()}
+                return {k: convert_for_json(v) for k, v in obj.items() if v is not None}
             elif isinstance(obj, list):
-                return [convert_numpy(item) for item in obj]
+                return [convert_for_json(item) for item in obj]
             else:
                 return obj
         
-        serializable_results = convert_numpy(results)
+        # Remove non-serializable items
+        serializable_results = {}
+        for key, value in results.items():
+            if key == 'final_temperature_function':
+                continue  # Skip FEniCS function
+            converted = convert_for_json(value)
+            if converted is not None:
+                serializable_results[key] = converted
         
         with open(filename, 'w') as f:
             json.dump({

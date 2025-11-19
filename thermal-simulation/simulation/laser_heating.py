@@ -686,7 +686,7 @@ class LaserHeatingSimulation(SimulationBase):
             surface_temp_stats_list = []
             laser_spot_max_temps = []
             laser_spot_pyrometer_temps = []
-
+            bottom_avg_temperatures = []  # New list for bottom surface max temps
             # Time stepping loop
             t_scaled = 0
             step = 0
@@ -747,7 +747,7 @@ class LaserHeatingSimulation(SimulationBase):
                 laser_spot_pyrometer_temp = self.convert_to_pyrometer_reading(current_avg_surface_temp)
 
                 # Progress reporting
-                if step % 5 == 0 or step < 20:
+                if step % 100 == 0 or step < 20:
                     if rank == 0:
                         print(f"Step {step:4d}, Real Time: {t_real:.4f}s, "
                                 f"Max Temp: {current_max_temp:.1f}K, "
@@ -769,7 +769,9 @@ class LaserHeatingSimulation(SimulationBase):
                     surface_temp_stats_list.append(surface_temp_stats)
                     laser_spot_max_temps.append(laser_spot_max_temp)
                     laser_spot_pyrometer_temps.append(laser_spot_pyrometer_temp)
-                    
+                    bottom_avg_temp = self.get_average_temperature_in_laser_spot_bottom_surface(self.u)
+                    bottom_avg_temperatures.append(bottom_avg_temp)
+
                     print(f"  Total data points stored: {len(times)}")
                     
                     if progress_callback:
@@ -783,6 +785,14 @@ class LaserHeatingSimulation(SimulationBase):
             print("Time stepping complete. Preparing results...")
             print(f"Total time points stored: {len(times)}")
             
+            print("Extracting surface temperature fields...")
+            
+            # Extract top surface temperature field
+            top_surface_temps = self.extract_surface_temperature_field(self.u, z='top')
+            
+            # Extract bottom surface temperature field  
+            bottom_surface_temps = self.extract_surface_temperature_field(self.u, z='bottom')
+
             # Compile RAW results
             raw_results = {
                 'times': times,
@@ -792,10 +802,14 @@ class LaserHeatingSimulation(SimulationBase):
                 'surface_temp_stats': surface_temp_stats_list, 
                 'laser_spot_max_temperatures': laser_spot_max_temps,
                 'laser_spot_pyrometer_temperatures': laser_spot_pyrometer_temps,
+                'bottom_avg_temperatures': bottom_avg_temperatures,  # Add this line
+
                 # 'melt_pool_volumes': [0.0] * len(times),  # Placeholder
                 # 'heat_fluxes': [0.0] * len(times),  # Placeholder
                 'final_temperature_function': self.u.copy(), #deepcopy=Tru
-                'parameters': self.parameters.copy()
+                'parameters': self.parameters.copy(),
+                'top_surface_field': top_surface_temps,
+                'bottom_surface_field': bottom_surface_temps
             }
 
             # Apply thermal correction post-processing
@@ -809,6 +823,72 @@ class LaserHeatingSimulation(SimulationBase):
             if rank == 0:
                 print(f"Simulation error: {e}")
             raise
+
+    # Replace the get_max_temperature_on_bottom_surface method with this:
+
+    def get_average_temperature_in_laser_spot_bottom_surface(self, temp_function=None):
+        """
+        Calculate average temperature on the bottom surface within the laser spot radius
+        
+        Args:
+            temp_function: Temperature function to evaluate (uses self.u if None)
+        
+        Returns:
+            float: Average temperature in laser spot area on bottom surface
+        """
+        if temp_function is None:
+            temp_function = self.u
+        
+        if temp_function is None:
+            return self.parameters['T_ambient']
+        
+        # Get laser parameters
+        L = self.parameters['length']
+        W = self.parameters['width']
+        laser_radius = self.parameters['beam_radius']
+        
+        # Laser position (same x,y as top, but z=0)
+        laser_x = self.parameters.get('laser_x_position', L / 2)
+        laser_y = self.parameters.get('laser_y_position', W / 2)
+        
+        # Sample points within laser spot on bottom surface
+        n_samples = 30  # Number of sampling points
+        temperatures = []
+        
+        # Sample in concentric circles within laser radius
+        for r_frac in np.linspace(0, 1, 10):  # Radial positions
+            r = r_frac * laser_radius
+            if r == 0:
+                # Center point
+                try:
+                    point = df.Point(laser_x, laser_y, 0.0)  # z=0 for bottom
+                    temp = temp_function(point)
+                    temperatures.append(temp)
+                except RuntimeError:
+                    temperatures.append(self.parameters['T_ambient'])
+            else:
+                # Points on circle
+                n_angular = max(8, int(2 * np.pi * r / (laser_radius / 5)))  # More points for larger circles
+                for theta in np.linspace(0, 2 * np.pi, n_angular, endpoint=False):
+                    x = laser_x + r * np.cos(theta)
+                    y = laser_y + r * np.sin(theta)
+                    
+                    # Check if point is within domain
+                    if 0 <= x <= L and 0 <= y <= W:
+                        try:
+                            point = df.Point(x, y, 0.0)  # z=0 for bottom
+                            temp = temp_function(point)
+                            temperatures.append(temp)
+                        except RuntimeError:
+                            temperatures.append(self.parameters['T_ambient'])
+        
+        # Calculate average
+        if temperatures:
+            avg_temp = np.mean(temperatures)
+        else:
+            avg_temp = self.parameters['T_ambient']
+        
+        return avg_temp
 
     def _run_fallback(self, progress_callback=None):
         """Fallback implementation when FEniCS is not available"""
@@ -845,6 +925,74 @@ class LaserHeatingSimulation(SimulationBase):
             'temperature_fields': [],
             'parameters': self.parameters.copy()
         }
+
+    def extract_surface_temperature_field(self, temp_function, z='top'):
+        """Extract temperature field on top or bottom surface"""
+        if temp_function is None:
+            return None
+            
+        L = self.parameters['length']
+        W = self.parameters['width']
+        H = self.parameters['height']
+        
+        # Grid resolution for extraction
+        nx = ny = 50
+        x = np.linspace(0, L, nx)
+        y = np.linspace(0, W, ny)
+        
+        # Set z coordinate based on surface
+        z_coord = H if z == 'top' else 0.0
+        
+        # Extract temperatures
+        surface_data = {
+            'x': x.tolist(),
+            'y': y.tolist(),
+            'nx': nx,
+            'ny': ny,
+            'temperatures': []
+        }
+        
+        for yi in y:
+            row = []
+            for xi in x:
+                try:
+                    point = df.Point(xi, yi, z_coord)
+                    temp = float(temp_function(point))
+                except:
+                    temp = float(self.parameters['T_ambient'])
+                row.append(temp)
+            surface_data['temperatures'].append(row)
+        
+        return surface_data
+
+    def extract_bottom_surface_temperature_from_function(self, temp_function):
+        """Extract temperature on the bottom surface using provided function"""
+        if temp_function is None:
+            return None
+        
+        # Get geometry parameters
+        L = self.parameters['length']
+        W = self.parameters['width']
+        # Bottom surface is at z = 0
+        
+        # Create surface grid
+        nx = ny = 50
+        x = np.linspace(0, L, nx)
+        y = np.linspace(0, W, ny)
+        X, Y = np.meshgrid(x, y)
+        
+        # Extract temperature at z = 0 (bottom surface)
+        temp_surface = np.zeros((ny, nx))
+        
+        for i in range(ny):
+            for j in range(nx):
+                try:
+                    point = df.Point(X[i, j], Y[i, j], 0.0)  # z = 0 for bottom
+                    temp_surface[i, j] = temp_function(point)
+                except RuntimeError:
+                    temp_surface[i, j] = self.parameters['T_ambient']
+        
+        return X, Y, temp_surface
 
     def extract_temperature_field(self):
         """Extract temperature field on a regular grid for visualization"""
@@ -1084,12 +1232,140 @@ class LaserHeatingSimulation(SimulationBase):
             'laser_radius_mm': laser_radius * 1000 *20
         }    
     
+    # def plot_results(self, results, axes):
+    #     """
+    #     Plots for 3D FEniCS simulation with power scaling.
+    #     Shows surface heat maps, cross-sections, and average laser spot temperatures.
+    #     """
+    #     ax1, ax2, ax3, ax4 = axes
+        
+    #     # Clear any existing colorbars
+    #     for cbar in self.colorbars:
+    #         try:
+    #             cbar.remove()
+    #         except:
+    #             pass
+    #     self.colorbars.clear()
+        
+    #     # Get final temperature function
+    #     final_temp_func = results.get('final_temperature_function', None)
+        
+    #     # Plot 1: Surface temperature heat map
+    #     ax1.clear()
+    #     if final_temp_func is not None:
+    #         try:
+    #             surface_data = self.extract_surface_temperature_from_function(final_temp_func)
+    #             if surface_data:
+    #                 X, Y = surface_data['X'], surface_data['Y']
+    #                 surface_temp = surface_data['temperature']
+                    
+    #                 im = ax1.contourf(X*1000, Y*1000, surface_temp, levels=50, cmap='hot')
+                    
+    #                 try:
+    #                     cbar = plt.colorbar(im, ax=ax1, label='Temperature (K)', shrink=0.8)
+    #                     self.colorbars.append(cbar)
+    #                 except:
+    #                     pass
+                    
+    #                 # Add melting contour if applicable
+    #                 T_melt = self.parameters['T_melt']
+    #                 if np.max(surface_temp) > T_melt:
+    #                     ax1.contour(X*1000, Y*1000, surface_temp, levels=[T_melt], 
+    #                             colors='cyan', linewidths=2, linestyles='--')
+                    
+    #                 ax1.set_xlabel('X (mm)')
+    #                 ax1.set_ylabel('Y (mm)')
+    #                 ax1.set_title('Surface Temperature at Final Time')
+    #                 ax1.set_aspect('equal')
+    #             else:
+    #                 ax1.set_title('Surface Temperature - No Data Available')
+    #         except Exception as e:
+    #             ax1.set_title('Surface Temperature - Error')
+    #     else:
+    #         ax1.set_title('Surface Temperature - No Temperature Function')
+        
+    #     # Plot 2: X-Z Cross-section
+    #     ax2.clear()
+    #     if final_temp_func is not None:
+    #         try:
+    #             self.plot_xz_cross_section_from_function(ax2, final_temp_func)
+    #         except Exception as e:
+    #             ax2.set_title('X-Z Cross-Section - Error')
+    #     else:
+    #         ax2.set_title('X-Z Cross-Section - No Data Available')
+
+    #     # Plot 3: Y-Z Cross-section
+    #     ax3.clear()
+    #     if final_temp_func is not None:
+    #         try:
+    #             self.plot_yz_cross_section_from_function(ax3, final_temp_func)
+    #         except Exception as e:
+    #             ax3.set_title('Y-Z Cross-Section - Error')
+    #     else:
+    #         ax3.set_title('Y-Z Cross-Section - No Data Available')
+
+    #     # Plot 4: Temperature vs time - AVERAGE LASER SPOT TEMPERATURES
+    #     ax4.clear()
+        
+    #     if 'times' not in results or len(results['times']) == 0:
+    #         ax4.set_title('No Time Data Available')
+    #         return
+            
+    #     times = results['times']
+        
+    #     # Plot average surface temperatures in laser spot (main curve)
+    #     if 'avg_surface_temperatures' in results and len(results['avg_surface_temperatures']) == len(times):
+    #         ax4.plot(times, results['avg_surface_temperatures'], 'r-', 
+    #                 linewidth=3, label='Average Surface Temp (Laser Spot)')
+        
+    #     # Plot pyrometer reading (what you'd actually measure)
+    #     if 'laser_spot_pyrometer_temperatures' in results and len(results['laser_spot_pyrometer_temperatures']) == len(times):
+    #         ax4.plot(times, results['laser_spot_pyrometer_temperatures'], 'b-', 
+    #                 linewidth=2, label='Pyrometer Reading', linestyle='--')
+        
+    #     # Plot global max for reference (thinner line)
+    #     if 'max_temperatures' in results and len(results['max_temperatures']) == len(times):
+    #         ax4.plot(times, results['max_temperatures'], 'g-', 
+    #                 linewidth=1.5, label='Global Max Temperature', alpha=0.7)
+        
+    #     # Styling
+    #     ax4.set_xlabel('Time (s)', fontsize=12)
+    #     ax4.set_ylabel('Temperature (K)', fontsize=12)
+    #     ax4.grid(True, alpha=0.3)
+    #     ax4.legend()
+        
+    #     # Title with power scaling info
+    #     scale_factor = self.parameters.get('time_scale_factor', 1.0)
+    #     if scale_factor > 1:
+    #         ax4.set_title(f'Temperature vs Time (Power Scaled by √{scale_factor:.0f})', fontsize=11)
+    #     else:
+    #         ax4.set_title('Temperature vs Time', fontsize=11)
+        
+    #     # Add power info text box
+    #     current_power = self.parameters['peak_laser_power']
+    #     if scale_factor > 1:
+    #         scaled_power = current_power / np.sqrt(scale_factor)
+    #         power_info = f'Original Power: {current_power:.0f}W\nScaled Power: {scaled_power:.1f}W'
+    #     else:
+    #         power_info = f'Laser Power: {current_power:.0f}W'
+        
+    #     props = dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.8)
+    #     ax4.text(0.02, 0.98, power_info, transform=ax4.transAxes, fontsize=9,
+    #             verticalalignment='top', bbox=props)
+
     def plot_results(self, results, axes):
         """
         Plots for 3D FEniCS simulation with power scaling.
         Shows surface heat maps, cross-sections, and average laser spot temperatures.
         """
-        ax1, ax2, ax3, ax4 = axes
+        if not results or len(axes) < 5:
+            return
+            
+        ax1, ax2, ax3, ax4, ax5 = axes
+        
+        # Store reference to colorbars if not exists
+        if not hasattr(self, 'colorbars'):
+            self.colorbars = []
         
         # Clear any existing colorbars
         for cbar in self.colorbars:
@@ -1102,7 +1378,7 @@ class LaserHeatingSimulation(SimulationBase):
         # Get final temperature function
         final_temp_func = results.get('final_temperature_function', None)
         
-        # Plot 1: Surface temperature heat map
+        # Plot 1: Surface temperature heat map (TOP SURFACE - LASER SIDE)
         ax1.clear()
         if final_temp_func is not None:
             try:
@@ -1112,7 +1388,6 @@ class LaserHeatingSimulation(SimulationBase):
                     surface_temp = surface_data['temperature']
                     
                     im = ax1.contourf(X*1000, Y*1000, surface_temp, levels=50, cmap='hot')
-                    
                     try:
                         cbar = plt.colorbar(im, ax=ax1, label='Temperature (K)', shrink=0.8)
                         self.colorbars.append(cbar)
@@ -1127,7 +1402,7 @@ class LaserHeatingSimulation(SimulationBase):
                     
                     ax1.set_xlabel('X (mm)')
                     ax1.set_ylabel('Y (mm)')
-                    ax1.set_title('Surface Temperature at Final Time')
+                    ax1.set_title('Temperature On Laser Side Surface')
                     ax1.set_aspect('equal')
                 else:
                     ax1.set_title('Surface Temperature - No Data Available')
@@ -1136,75 +1411,104 @@ class LaserHeatingSimulation(SimulationBase):
         else:
             ax1.set_title('Surface Temperature - No Temperature Function')
         
-        # Plot 2: X-Z Cross-section
+        # Plot 2: BOTTOM SURFACE temperature heat map (NEW)
         ax2.clear()
         if final_temp_func is not None:
             try:
-                self.plot_xz_cross_section_from_function(ax2, final_temp_func)
+                result = self.extract_bottom_surface_temperature_from_function(final_temp_func)
+                if result is not None:
+                    X, Y, temp_surface = result
+                    
+                    im = ax2.contourf(X*1000, Y*1000, temp_surface, levels=50, cmap='hot')
+                    ax2.set_xlabel('X (mm)')
+                    ax2.set_ylabel('Y (mm)')
+                    ax2.set_title('Temp Opposite Laser Side')
+                    ax2.set_aspect('equal')
+                    
+                    # Add colorbar
+                    try:
+                        cbar = plt.colorbar(im, ax=ax2, label='Temperature (K)', shrink=0.8)
+                        self.colorbars.append(cbar)
+                    except:
+                        pass
+                    
+                    # Add temperature info
+                    temp_min = np.min(temp_surface)
+                    temp_max = np.max(temp_surface)
+                    temp_info = f'Range: {temp_min:.1f} - {temp_max:.1f} K'
+                    props = dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
+                    ax2.text(0.02, 0.98, temp_info, transform=ax2.transAxes, fontsize=9,
+                            verticalalignment='top', bbox=props)
+                else:
+                    ax2.set_title('Bottom Surface - No Data Available')
             except Exception as e:
-                ax2.set_title('X-Z Cross-Section - Error')
+                ax2.set_title('Bottom Surface - Error')
+                print(f"Error plotting bottom surface: {e}")
         else:
-            ax2.set_title('X-Z Cross-Section - No Data Available')
-
-        # Plot 3: Y-Z Cross-section
+            ax2.set_title('Bottom Surface - No Temperature Function')
+        
+        # Plot 3: X-Z Cross-section
         ax3.clear()
         if final_temp_func is not None:
             try:
-                self.plot_yz_cross_section_from_function(ax3, final_temp_func)
+                self.plot_xz_cross_section_from_function(ax3, final_temp_func)
             except Exception as e:
-                ax3.set_title('Y-Z Cross-Section - Error')
+                ax3.set_title('X-Z Cross-Section - Error')
         else:
-            ax3.set_title('Y-Z Cross-Section - No Data Available')
-
-        # Plot 4: Temperature vs time - AVERAGE LASER SPOT TEMPERATURES
+            ax3.set_title('X-Z Cross-Section - No Data Available')
+        
+        # Plot 4: Y-Z Cross-section  
         ax4.clear()
+        if final_temp_func is not None:
+            try:
+                self.plot_yz_cross_section_from_function(ax4, final_temp_func)
+            except Exception as e:
+                ax4.set_title('Y-Z Cross-Section - Error')
+        else:
+            ax4.set_title('Y-Z Cross-Section - No Data Available')
+        
+        # Plot 5: Temperature vs time - AVERAGE LASER SPOT TEMPERATURES
+        ax5.clear()
         
         if 'times' not in results or len(results['times']) == 0:
-            ax4.set_title('No Time Data Available')
+            ax5.set_title('No Time Data Available')
             return
             
         times = results['times']
         
         # Plot average surface temperatures in laser spot (main curve)
         if 'avg_surface_temperatures' in results and len(results['avg_surface_temperatures']) == len(times):
-            ax4.plot(times, results['avg_surface_temperatures'], 'r-', 
+            ax5.plot(times, results['avg_surface_temperatures'], 'r-', 
                     linewidth=3, label='Average Surface Temp (Laser Spot)')
         
         # Plot pyrometer reading (what you'd actually measure)
         if 'laser_spot_pyrometer_temperatures' in results and len(results['laser_spot_pyrometer_temperatures']) == len(times):
-            ax4.plot(times, results['laser_spot_pyrometer_temperatures'], 'b-', 
+            ax5.plot(times, results['laser_spot_pyrometer_temperatures'], 'b-', 
                     linewidth=2, label='Pyrometer Reading', linestyle='--')
         
         # Plot global max for reference (thinner line)
         if 'max_temperatures' in results and len(results['max_temperatures']) == len(times):
-            ax4.plot(times, results['max_temperatures'], 'g-', 
+            ax5.plot(times, results['max_temperatures'], 'g-', 
                     linewidth=1.5, label='Global Max Temperature', alpha=0.7)
+            
+                # ADD THIS: Plot bottom surface maximum temperature
+        if 'bottom_avg_temperatures' in results and len(results['bottom_avg_temperatures']) == len(times):
+            ax5.plot(times, results['bottom_avg_temperatures'], 'm-', 
+                    linewidth=2, label='Avg Bottom Temp (Laser Spot)', linestyle=':')
+        
+        # Add setpoint if using temperature control
+        if 'setpoint_temperatures' in results and len(results['setpoint_temperatures']) > 0:
+            setpoint_times = times[:len(results['setpoint_temperatures'])]
+            ax5.plot(setpoint_times, results['setpoint_temperatures'], 'k--', 
+                    label='Temperature Setpoint', linewidth=2, alpha=0.7)
         
         # Styling
-        ax4.set_xlabel('Time (s)', fontsize=12)
-        ax4.set_ylabel('Temperature (K)', fontsize=12)
-        ax4.grid(True, alpha=0.3)
-        ax4.legend()
-        
-        # Title with power scaling info
-        scale_factor = self.parameters.get('time_scale_factor', 1.0)
-        if scale_factor > 1:
-            ax4.set_title(f'Temperature vs Time (Power Scaled by √{scale_factor:.0f})', fontsize=11)
-        else:
-            ax4.set_title('Temperature vs Time', fontsize=11)
-        
-        # Add power info text box
-        current_power = self.parameters['peak_laser_power']
-        if scale_factor > 1:
-            scaled_power = current_power / np.sqrt(scale_factor)
-            power_info = f'Original Power: {current_power:.0f}W\nScaled Power: {scaled_power:.1f}W'
-        else:
-            power_info = f'Laser Power: {current_power:.0f}W'
-        
-        props = dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.8)
-        ax4.text(0.02, 0.98, power_info, transform=ax4.transAxes, fontsize=9,
-                verticalalignment='top', bbox=props)
-    
+        ax5.set_xlabel('Time (s)', fontsize=12)
+        ax5.set_ylabel('Temperature (K)', fontsize=12)
+        ax5.set_title('Temperature vs Time')
+        ax5.grid(True, alpha=0.3)
+        ax5.legend(loc = 'best') 
+   
     def extract_surface_temperature_from_function(self, temp_function):
         """Extract temperature on the top surface using provided function"""
         if temp_function is None:
@@ -1242,111 +1546,245 @@ class LaserHeatingSimulation(SimulationBase):
             'temperature': surface_temp
         }
 
-    def plot_xz_cross_section_from_function(self, ax, temp_function):
-        """Plot temperature cross-section in X-Z plane using provided function"""
+    # Add this method to your LaserHeatingSimulation class:
+
+    def extract_bottom_surface_temperature_from_function(self, temp_function):
+        """Extract temperature on the bottom surface (z=0) using provided function"""
         if temp_function is None:
-            ax.set_title('X-Z Cross-Section - No Data Available')
-            return
+            return None
         
         # Get geometry parameters
         L = self.parameters['length']
         W = self.parameters['width']
+        
+        # Create surface grid
+        nx = ny = 50
+        x = np.linspace(0, L, nx)
+        y = np.linspace(0, W, ny)
+        X, Y = np.meshgrid(x, y)
+        
+        # Extract temperature at z = 0 (bottom surface)
+        temp_surface = np.zeros((ny, nx))
+        
+        for i in range(ny):
+            for j in range(nx):
+                try:
+                    point = df.Point(X[i, j], Y[i, j], 0.0)  # z = 0 for bottom
+                    temp_surface[i, j] = temp_function(point)
+                except RuntimeError:
+                    temp_surface[i, j] = self.parameters['T_ambient']
+        
+        return X, Y, temp_surface
+
+    # Also, update the cross-section plotting methods to use microns:
+
+    def plot_xz_cross_section_from_function(self, ax, temp_function):
+        """Plot X-Z cross section at Y=W/2"""
+        if temp_function is None:
+            return
+        
+        L = self.parameters['length']
+        W = self.parameters['width']
         H = self.parameters['height']
         
-        # Cross-section at centerline (y = W/2)
-        y_cross = W / 2
-        
-        # Create grid
-        nx, nz = 80, 40
+        # Create grid for cross-section
+        nx = 100
+        nz = 50
         x = np.linspace(0, L, nx)
         z = np.linspace(0, H, nz)
         X, Z = np.meshgrid(x, z)
         
-        # Extract temperature
-        temp_xz = np.zeros((nz, nx))
+        # Extract temperature at y = W/2
+        y_mid = W / 2
+        temp_cross = np.zeros((nz, nx))
         
         for i in range(nz):
             for j in range(nx):
                 try:
-                    point = df.Point(X[i, j], y_cross, Z[i, j])
-                    temp_xz[i, j] = temp_function(point)
+                    point = df.Point(X[i, j], y_mid, Z[i, j])
+                    temp_cross[i, j] = temp_function(point)
                 except RuntimeError:
-                    temp_xz[i, j] = self.parameters['T_ambient']
+                    temp_cross[i, j] = self.parameters['T_ambient']
         
-        # Create heat map
-        im = ax.contourf(X*1000, Z*1000, temp_xz, levels=50, cmap='hot')
+        # Plot with Z-axis in microns
+        im = ax.contourf(X*1000, Z*1e6, temp_cross, levels=50, cmap='hot')  # Z in microns
         
         # Add colorbar
         try:
-            cbar = plt.colorbar(im, ax=ax, label='Temperature (K)', shrink=0.8)
-            self.colorbars.append(cbar)  # Store for cleanup
-        except Exception as e:
-            print(f"Warning: Could not create colorbar for XZ plot: {e}")
+            cbar = plt.colorbar(im, ax=ax, label='Temperature (K)')
+            self.colorbars.append(cbar)
+        except:
+            pass
         
-        # Add melting temperature contour
-        T_melt = self.parameters['T_melt']
-        if np.max(temp_xz) > T_melt:
-            ax.contour(X*1000, Z*1000, temp_xz, levels=[T_melt], 
-                    colors='cyan', linewidths=2, linestyles='--')
+        ax.set_xlabel('X (mm)')
+        ax.set_ylabel('Z (μm)')  # Changed to microns
+        ax.set_title('X-Z Cross-Section at Y=W/2')
+        ax.set_aspect('auto')  # Don't force equal aspect ratio
         
-        ax.set_xlabel('X Position (mm)')
-        ax.set_ylabel('Depth (mm)')
-        ax.set_title(f'X-Z Cross-Section at Y={y_cross*1000:.1f} mm')
-        ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
+        # Add temperature info
+        temp_min = np.min(temp_cross)
+        temp_max = np.max(temp_cross)
+        temp_info = f'Range: {temp_min:.1f} - {temp_max:.1f} K'
+        props = dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
+        ax.text(0.02, 0.98, temp_info, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top', bbox=props)
 
     def plot_yz_cross_section_from_function(self, ax, temp_function):
-        """Plot temperature cross-section in Y-Z plane using provided function"""
+        """Plot Y-Z cross section at X=L/2"""
         if temp_function is None:
-            ax.set_title('Y-Z Cross-Section - No Data Available')
             return
         
-        # Get geometry parameters
         L = self.parameters['length']
         W = self.parameters['width']
         H = self.parameters['height']
         
-        # Cross-section at centerline (x = L/2)
-        x_cross = L / 2
-        
-        # Create grid
-        ny, nz = 80, 40
+        # Create grid for cross-section
+        ny = 100
+        nz = 50
         y = np.linspace(0, W, ny)
         z = np.linspace(0, H, nz)
         Y, Z = np.meshgrid(y, z)
         
-        # Extract temperature
-        temp_yz = np.zeros((nz, ny))
+        # Extract temperature at x = L/2
+        x_mid = L / 2
+        temp_cross = np.zeros((nz, ny))
         
         for i in range(nz):
             for j in range(ny):
                 try:
-                    point = df.Point(x_cross, Y[i, j], Z[i, j])
-                    temp_yz[i, j] = temp_function(point)
+                    point = df.Point(x_mid, Y[i, j], Z[i, j])
+                    temp_cross[i, j] = temp_function(point)
                 except RuntimeError:
-                    temp_yz[i, j] = self.parameters['T_ambient']
+                    temp_cross[i, j] = self.parameters['T_ambient']
         
-        # Create heat map
-        im = ax.contourf(Y*1000, Z*1000, temp_yz, levels=50, cmap='hot')
+        # Plot with Z-axis in microns
+        im = ax.contourf(Y*1000, Z*1e6, temp_cross, levels=50, cmap='hot')  # Z in microns
         
         # Add colorbar
         try:
-            cbar = plt.colorbar(im, ax=ax, label='Temperature (K)', shrink=0.8)
-            self.colorbars.append(cbar)  # Store for cleanup
-        except Exception as e:
-            print(f"Warning: Could not create colorbar for YZ plot: {e}")
+            cbar = plt.colorbar(im, ax=ax, label='Temperature (K)')
+            self.colorbars.append(cbar)
+        except:
+            pass
         
-        # Add melting temperature contour
-        T_melt = self.parameters['T_melt']
-        if np.max(temp_yz) > T_melt:
-            ax.contour(Y*1000, Z*1000, temp_yz, levels=[T_melt], 
-                    colors='cyan', linewidths=2, linestyles='--')
+        ax.set_xlabel('Y (mm)')
+        ax.set_ylabel('Z (μm)')  # Changed to microns
+        ax.set_title('Y-Z Cross-Section at X=L/2')
+        ax.set_aspect('auto')  # Don't force equal aspect ratio
         
-        ax.set_xlabel('Y Position (mm)')
-        ax.set_ylabel('Depth (mm)')
-        ax.set_title(f'Y-Z Cross-Section at X={x_cross*1000:.1f} mm')
-        ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
+        # Add temperature info
+        temp_min = np.min(temp_cross)
+        temp_max = np.max(temp_cross)
+        temp_info = f'Range: {temp_min:.1f} - {temp_max:.1f} K'
+        props = dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
+        ax.text(0.02, 0.98, temp_info, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top', bbox=props)
+
+    # def plot_xz_cross_section_from_function(self, ax, temp_function):
+    #     """Plot temperature cross-section in X-Z plane using provided function"""
+    #     if temp_function is None:
+    #         ax.set_title('X-Z Cross-Section - No Data Available')
+    #         return
+        
+    #     # Get geometry parameters
+    #     L = self.parameters['length']
+    #     W = self.parameters['width']
+    #     H = self.parameters['height']
+        
+    #     # Cross-section at centerline (y = W/2)
+    #     y_cross = W / 2
+        
+    #     # Create grid
+    #     nx, nz = 80, 40
+    #     x = np.linspace(0, L, nx)
+    #     z = np.linspace(0, H, nz)
+    #     X, Z = np.meshgrid(x, z)
+        
+    #     # Extract temperature
+    #     temp_xz = np.zeros((nz, nx))
+        
+    #     for i in range(nz):
+    #         for j in range(nx):
+    #             try:
+    #                 point = df.Point(X[i, j], y_cross, Z[i, j])
+    #                 temp_xz[i, j] = temp_function(point)
+    #             except RuntimeError:
+    #                 temp_xz[i, j] = self.parameters['T_ambient']
+        
+    #     # Create heat map
+    #     im = ax.contourf(X*1000, Z*1000, temp_xz, levels=50, cmap='hot')
+        
+    #     # Add colorbar
+    #     try:
+    #         cbar = plt.colorbar(im, ax=ax, label='Temperature (K)', shrink=0.8)
+    #         self.colorbars.append(cbar)  # Store for cleanup
+    #     except Exception as e:
+    #         print(f"Warning: Could not create colorbar for XZ plot: {e}")
+        
+    #     # Add melting temperature contour
+    #     T_melt = self.parameters['T_melt']
+    #     if np.max(temp_xz) > T_melt:
+    #         ax.contour(X*1000, Z*1000, temp_xz, levels=[T_melt], 
+    #                 colors='cyan', linewidths=2, linestyles='--')
+        
+    #     ax.set_xlabel('X Position (mm)')
+    #     ax.set_ylabel('Depth (mm)')
+    #     ax.set_title(f'X-Z Cross-Section at Y={y_cross*1000:.1f} mm')
+    #     ax.set_aspect('equal')
+    #     ax.grid(True, alpha=0.3)
+
+    # #def plot_yz_cross_section_from_function(self, ax, temp_function):
+    #     """Plot temperature cross-section in Y-Z plane using provided function"""
+    #     if temp_function is None:
+    #         ax.set_title('Y-Z Cross-Section - No Data Available')
+    #         return
+        
+    #     # Get geometry parameters
+    #     L = self.parameters['length']
+    #     W = self.parameters['width']
+    #     H = self.parameters['height']
+        
+    #     # Cross-section at centerline (x = L/2)
+    #     x_cross = L / 2
+        
+    #     # Create grid
+    #     ny, nz = 80, 40
+    #     y = np.linspace(0, W, ny)
+    #     z = np.linspace(0, H, nz)
+    #     Y, Z = np.meshgrid(y, z)
+        
+    #     # Extract temperature
+    #     temp_yz = np.zeros((nz, ny))
+        
+    #     for i in range(nz):
+    #         for j in range(ny):
+    #             try:
+    #                 point = df.Point(x_cross, Y[i, j], Z[i, j])
+    #                 temp_yz[i, j] = temp_function(point)
+    #             except RuntimeError:
+    #                 temp_yz[i, j] = self.parameters['T_ambient']
+        
+    #     # Create heat map
+    #     im = ax.contourf(Y*1000, Z*1000, temp_yz, levels=50, cmap='hot')
+        
+    #     # Add colorbar
+    #     try:
+    #         cbar = plt.colorbar(im, ax=ax, label='Temperature (K)', shrink=0.8)
+    #         self.colorbars.append(cbar)  # Store for cleanup
+    #     except Exception as e:
+    #         print(f"Warning: Could not create colorbar for YZ plot: {e}")
+        
+    #     # Add melting temperature contour
+    #     T_melt = self.parameters['T_melt']
+    #     if np.max(temp_yz) > T_melt:
+    #         ax.contour(Y*1000, Z*1000, temp_yz, levels=[T_melt], 
+    #                 colors='cyan', linewidths=2, linestyles='--')
+        
+    #     ax.set_xlabel('Y Position (mm)')
+    #     ax.set_ylabel('Depth (mm)')
+    #     ax.set_title(f'Y-Z Cross-Section at X={x_cross*1000:.1f} mm')
+    #     ax.set_aspect('equal')
+    #     ax.grid(True, alpha=0.3)
    
     def validate_parameters(self):
         """Validate parameters specific to laser heating simulation"""

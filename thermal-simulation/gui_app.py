@@ -118,8 +118,8 @@ class ThermalSimulationGUI:
             ("Ambient Temperature (K)", "T_ambient", 298.0),
             ("Emissivity", "emissivity", 0.9),
             ("Stefan-Boltzmann Constant", "stefan_boltzmann", 5.67e-8),
-            ("Laser X Position (m)", "laser_x", 0.004),  # Default to center
-            ("Laser Y Position (m)", "laser_y", 0.004)
+            # ("Laser X Position (m)", "laser_x", 0.004),  # Default to center
+            # ("Laser Y Position (m)", "laser_y", 0.004)
         ]
         
         for i, (label, key, default) in enumerate(material_params):
@@ -733,10 +733,34 @@ class ThermalSimulationGUI:
                                           maximum=100, length=300)
         self.progress_bar.pack(fill='x', pady=2)
 
+    # def create_plot_area(self, parent):
+    #     """Create the plotting area"""
+    #     # Create matplotlib figure
+    #     self.fig, ((self.ax1, self.ax2), (self.ax3, self.ax4)) = plt.subplots(2, 2, figsize=(12, 8))
+    #     self.fig.suptitle("Simulation Results")
+        
+    #     # Create canvas
+    #     self.canvas = FigureCanvasTkAgg(self.fig, parent)
+    #     self.canvas.draw()
+    #     self.canvas.get_tk_widget().pack(fill='both', expand=True)
+        
+    #     # Initialize empty plots
+    #     for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
+    #         ax.set_title("No data")
+    #         ax.grid(True, alpha=0.3)
+
     def create_plot_area(self, parent):
         """Create the plotting area"""
-        # Create matplotlib figure
-        self.fig, ((self.ax1, self.ax2), (self.ax3, self.ax4)) = plt.subplots(2, 2, figsize=(12, 8))
+        # Create matplotlib figure with 2x3 layout for 5 plots
+        self.fig = plt.figure(figsize=(15, 10))
+        
+        # Create 5 subplots in a 2x3 grid
+        self.ax1 = self.fig.add_subplot(2, 3, 1)  # Top-left
+        self.ax2 = self.fig.add_subplot(2, 3, 2)  # Top-center
+        self.ax3 = self.fig.add_subplot(2, 3, 3)  # Top-right
+        self.ax4 = self.fig.add_subplot(2, 3, 4)  # Bottom-left
+        self.ax5 = self.fig.add_subplot(2, 3, 5)  # Bottom-center
+        
         self.fig.suptitle("Simulation Results")
         
         # Create canvas
@@ -745,9 +769,13 @@ class ThermalSimulationGUI:
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
         
         # Initialize empty plots
-        for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
+        for ax in [self.ax1, self.ax2, self.ax3, self.ax4, self.ax5]:
             ax.set_title("No data")
             ax.grid(True, alpha=0.3)
+        
+        # Adjust layout to prevent overlap
+        self.fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
 
     def on_sim_type_change(self):
         """Handle simulation type change"""
@@ -1010,7 +1038,7 @@ class ThermalSimulationGUI:
         try:
             # Update plots based on results
             if self.current_simulation:
-                self.current_simulation.plot_results(self.results, [self.ax1, self.ax2, self.ax3, self.ax4])
+                self.current_simulation.plot_results(self.results, [self.ax1, self.ax2, self.ax3, self.ax4, self.ax5])
             
             plt.tight_layout()
             self.canvas.draw()
@@ -1029,7 +1057,7 @@ class ThermalSimulationGUI:
                 pass  # Colorbar might already be removed
         self.colorbars.clear()
 
-        for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
+        for ax in [self.ax1, self.ax2, self.ax3, self.ax4, self.ax5]:
             ax.clear()
             ax.set_title("No data")
             ax.grid(True, alpha=0.3)
