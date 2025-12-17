@@ -12,28 +12,59 @@ from pathlib import Path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+# def run_gui():
+#     """Launch the GUI application"""
+#     try:
+#         import dolfin
+#         print("FEniCS loaded succesfully")
+
+#         import tkinter as tk
+#         from gui_app import ThermalSimulationGUI
+        
+#         root = tk.Tk()
+#         app = ThermalSimulationGUI(root)
+#         root.mainloop()
+        
+#     except ImportError as e:
+#         if "dolfin" in str(e):
+#             print("FEniCS not found. Please install FEniCS first.")
+#         else:
+#             print(f"Error importing components: {e}")
+#         sys.exit(1)
+        
+#     except Exception as e:
+#         print(f"Error launching GUI: {e}")
+#         sys.exit(1)
+
 def run_gui():
     """Launch the GUI application"""
     try:
         import dolfin
-        print("FEniCS loaded succesfully")
-
+        print("FEniCS loaded successfully")
+        
+        # Add more specific imports to trace the error
+        print("Importing tkinter...")
         import tkinter as tk
+        
+        print("Importing gui_app...")
         from gui_app import ThermalSimulationGUI
         
+        print("Creating root window...")
         root = tk.Tk()
+        
+        print("Creating app...")
         app = ThermalSimulationGUI(root)
+        
+        print("Starting mainloop...")
         root.mainloop()
         
     except ImportError as e:
+        import traceback
+        traceback.print_exc()  # This will show the full error trace
         if "dolfin" in str(e):
             print("FEniCS not found. Please install FEniCS first.")
         else:
             print(f"Error importing components: {e}")
-        sys.exit(1)
-        
-    except Exception as e:
-        print(f"Error launching GUI: {e}")
         sys.exit(1)
 
 def run_batch_simulation(sim_type, config_file=None):

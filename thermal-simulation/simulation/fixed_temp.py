@@ -143,18 +143,19 @@ class FixedTempSimulation(SimulationBase):  # Add inheritance here
             self.F = F
 
             # Solver parameters
-            self.solver_params = {
-                'nonlinear_solver': 'newton',
-                'newton_solver': {
-                    'relative_tolerance': 1e-6,
-                    'absolute_tolerance': 1e-10,
-                    'maximum_iterations': 100,
-                    'linear_solver': 'mumps',
-                    'preconditioner': 'default',
-                    'relaxation_parameter': 0.8,
-                    'error_on_nonconvergence': False
-                }
-            }
+            self.solver_params = self.get_default_solver_params()
+            # self.solver_params = {
+            #     'nonlinear_solver': 'newton',
+            #     'newton_solver': {
+            #         'relative_tolerance': 1e-6,
+            #         'absolute_tolerance': 1e-10,
+            #         'maximum_iterations': 100,
+            #         'linear_solver': 'mumps',
+            #         'preconditioner': 'default',
+            #         'relaxation_parameter': 0.8,
+            #         'error_on_nonconvergence': False
+            #     }
+            # }
 
         except Exception as e:
             raise RuntimeError(f"Failed to set up simulation: {str(e)}")

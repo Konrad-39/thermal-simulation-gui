@@ -1,3 +1,4 @@
+
 # laser_heating.py
 """
 3D Laser heating simulation using FEniCS.
@@ -25,6 +26,53 @@ try:
 except ImportError:
     FENICS_AVAILABLE = False
     print("Warning: FEniCS not available. Using fallback implementation.")
+
+class GaussianLaserFlux(df.UserExpression):
+    """
+    Gaussian laser surface flux expression.
+    
+    For a Gaussian beam, the intensity distribution is:
+    I(r) = I0 * exp(-2*r²/w²)
+    
+    Where:
+    - I0 = 2*P/(π*w²) is the peak intensity
+    - P is the total power
+    - w is the beam radius (1/e² radius)
+    - r is the radial distance from beam center
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.power = 0.0
+        self.center_x = 0.0
+        self.center_y = 0.0
+        self.beam_radius = 0.001  # 1/e² radius
+        self.absorptivity = 1.0
+        
+    def set_parameters(self, power, center_x, center_y, beam_radius, absorptivity):
+        """Update laser parameters"""
+        self.power = power
+        self.center_x = center_x
+        self.center_y = center_y
+        self.beam_radius = beam_radius
+        self.absorptivity = absorptivity
+        
+    def eval(self, value, x):
+        """Evaluate the flux at position x"""
+        # Radial distance from beam center
+        r_squared = (x[0] - self.center_x)**2 + (x[1] - self.center_y)**2
+        
+        # Peak intensity (W/m²)
+        # Factor of 2 comes from Gaussian beam theory
+        I0 = (2.0 * self.power * self.absorptivity) / (np.pi * self.beam_radius**2)
+        
+        # Gaussian distribution
+        # exp(-2*r²/w²) gives 1/e² (13.5%) intensity at r = w
+        value[0] = I0 * np.exp(-2.0 * r_squared / self.beam_radius**2)
+        
+    def value_shape(self):
+        return ()
+
+
 
 class LaserHeatingSimulation(SimulationBase):
     """
@@ -54,6 +102,7 @@ class LaserHeatingSimulation(SimulationBase):
         self.mesh_handler = None
         self.time_solver = None
         self.colorbars = []
+        self.last_adaptation_time = -1.0
         self.default_parameters = {
             # Material properties (SiC)
             'k': 120.0,           # Thermal conductivity W/m·K
@@ -73,14 +122,14 @@ class LaserHeatingSimulation(SimulationBase):
             'cp_base': 750.0,
             
             # Geometry (3D)
-            'length': 0.008,      # m (x-direction)
-            'width': 0.008,       # m (y-direction)
-            'height': 0.0005,     # m (z-direction)
+            'length': 0.0508,      # m (x-direction)
+            'width': 0.0508,       # m (y-direction)
+            'height': 0.001,     # m (z-direction)
             'mesh_resolution': 35,
             
             # Laser parameters
             'peak_laser_power': 300.0,    # W
-            'beam_radius': 0.0005,        # m
+            'beam_radius': 0.00025,        # m
             'absorptivity': 0.95,         # Absorption coefficient
             'power_profile': 'constant',  # 'constant' or 'from_file'
             'power_file': '',             # Path to power file
@@ -97,6 +146,14 @@ class LaserHeatingSimulation(SimulationBase):
             'output_time_interval': 0.5,  # s
             'time_scale_factor': 1.0,     # Acceleration factor
             'scale_thermal_properties': True,
+
+            'use_adaptive_mesh': True,  # ENABLE AMR
+            'amr_interval': 20,  # Adapt every N steps
+            'min_time_between_adaptations': 0.5,  # seconds
+            'max_cells': 150000,
+            'use_conservative_interpolation': True,  # Enable energy conservation
+            'gradient_threshold_for_adaptation': 1000.0,  # K/m - adjust based on your needs
+            'temp_change_threshold_for_adaptation': 100.0,
         }
 
         # Initialize power interpolator
@@ -305,8 +362,9 @@ class LaserHeatingSimulation(SimulationBase):
         
         return should_output
 
+    
     def setup_fenics_problem(self):
-        """Setup 3D FEniCS mesh and function spaces"""
+        """Setup 3D FEniCS mesh and function spaces with surface flux heating"""
         if not FENICS_AVAILABLE:
             raise ImportError("FEniCS is required for this simulation")
             
@@ -324,12 +382,16 @@ class LaserHeatingSimulation(SimulationBase):
                 raise RuntimeError("Failed to initialize mesh handler")
             
             # Create mesh using mesh handler
-            # self.mesh = self.mesh_handler.create_mesh(None)
-            self.mesh = self.mesh_handler.create_statisic_optimized_mesh(None)
+            self.mesh = self.mesh_handler.create_mesh(None)
 
+            is_ok, msg = self.mesh_handler.check_diffusion_length(self.parameters['dt'])
+            print(f"Diffusion check: {msg}")
+            if not is_ok:
+                print("WARNING: Time step may be too large for accurate heat diffusion!")
+            
             # NOW initialize time solver with the mesh
             if self.time_solver is None:
-                self.time_solver = TimeSteppingSolver(self.parameters, None, self.mesh_handler)
+                self.time_solver = TimeSteppingSolver(self.parameters, self.V, self.mesh_handler) #self.V was None
                 print("Time solver initialized")
             
             # Check stability
@@ -355,7 +417,23 @@ class LaserHeatingSimulation(SimulationBase):
             estimated_temp_rise_per_sec = power / (mass * cp)
             print(f"Expected temperature rise: {estimated_temp_rise_per_sec:.1f} K/s")
             print(f"In {dt} seconds: {estimated_temp_rise_per_sec * dt:.3f} K")
-           
+            
+            # CREATE BOUNDARY MARKERS FOR SURFACE INTEGRATION
+            boundaries = df.MeshFunction("size_t", self.mesh, self.mesh.topology().dim()-1)
+            boundaries.set_all(0)
+            
+            # Define top surface subdomain
+            class TopSurface(df.SubDomain):
+                def inside(self, x, on_boundary):
+                    return on_boundary and df.near(x[2], H)
+            
+            # Mark top surface as 1
+            top_surface = TopSurface()
+            top_surface.mark(boundaries, 1)
+            
+            # Create measure for boundary integration
+            self.ds = df.Measure('ds', domain=self.mesh, subdomain_data=boundaries)
+        
             # Define function space
             self.V = df.FunctionSpace(self.mesh, 'P', 1)
             
@@ -370,8 +448,10 @@ class LaserHeatingSimulation(SimulationBase):
             self.u.assign(df.Constant(T_ambient))
             self.u_n.assign(df.Constant(T_ambient))
 
-            # Laser heat source (updated every time step)
-            self.laser_source = df.Function(self.V)
+            # INITIALIZE GAUSSIAN LASER FLUX (instead of volumetric source)
+            self.laser_flux = GaussianLaserFlux(degree=2)
+            self.laser_flux.set_parameters(0, 0, 0, self.parameters['beam_radius'], 
+                                        self.parameters['absorptivity'])
 
             # No Dirichlet BC - using natural BCs
             self.bcs = []
@@ -384,38 +464,33 @@ class LaserHeatingSimulation(SimulationBase):
             emissivity = self.parameters['emissivity']
             sigma = self.parameters['stefan_boltzmann']
 
-            # Check if using temperature-dependent properties
+            # Setup variational form
             if self.parameters.get('use_temperature_dependent_properties', False):
                 print("Setting up temperature-dependent variational form...")
                 self.setup_temperature_dependent_form(v, T_ambient, h_conv, emissivity, sigma)
             else:
                 print("Using constant material properties...")
-                # Use constant properties (your existing code)
-                self.F = (rho*cp*(self.u-self.u_n)*v + self.dt_param*k*df.dot(df.grad(self.u),df.grad(v)))*df.dx
+                # Volumetric terms (conduction)
+                self.F = (rho*cp*(self.u-self.u_n)*v + 
+                        self.dt_param*k*df.dot(df.grad(self.u),df.grad(v)))*df.dx
+                
+                # Surface terms (radiation and convection on ALL surfaces)
                 self.F += self.dt_param * emissivity * sigma * (self.u**4 - T_ambient**4) * v * df.ds
                 if h_conv > 0:
                     self.F += self.dt_param*h_conv*(self.u-T_ambient)*v*df.ds
-                self.F -= self.dt_param*self.laser_source*v*df.dx
+                
+                # SURFACE LASER HEATING (only on top surface)
+                self.F -= self.dt_param * self.laser_flux * v * self.ds(1)
 
+            # Solver parameters
+            self.solver_params = self.get_default_solver_params()
 
-            self.solver_params = {
-                'nonlinear_solver': 'newton',
-                'newton_solver': {
-                    'relative_tolerance': 1e-6,
-                    'absolute_tolerance': 1e-10,
-                    'maximum_iterations': 100,
-                    'linear_solver': 'mumps',
-                    'preconditioner': 'default',
-                    'relaxation_parameter': 0.8,
-                    'error_on_nonconvergence': False
-                }
-            }
-    
         except Exception as e:
             raise RuntimeError(f"Failed to set up simulation: {str(e)}")
-        
+    
+
     def setup_temperature_dependent_form(self, v, T_ambient, h_conv, emissivity, sigma):
-        """Setup variational form with temperature-dependent properties"""
+        """Setup variational form with temperature-dependent properties and surface flux"""
         # Create functions to hold the spatially-varying properties
         self.k_func = df.Function(self.V)
         self.rho_func = df.Function(self.V)
@@ -434,11 +509,13 @@ class LaserHeatingSimulation(SimulationBase):
         self.F = (self.rho_func * self.cp_func * (self.u - self.u_n) * v + 
                 self.dt_param * self.k_func * df.dot(df.grad(self.u), df.grad(v))) * df.dx
         
-        # Boundary terms remain the same
+        # Boundary terms - radiation and convection on all surfaces
         self.F += self.dt_param * emissivity * sigma * (self.u**4 - T_ambient**4) * v * df.ds
         if h_conv > 0:
             self.F += self.dt_param * h_conv * (self.u - T_ambient) * v * df.ds
-        self.F -= self.dt_param * self.laser_source * v * df.dx
+        
+        # SURFACE LASER HEATING (only on top surface)
+        self.F -= self.dt_param * self.laser_flux * v * self.ds(1)
 
     def update_material_properties(self):
         """Update material properties based on current temperature field"""
@@ -487,90 +564,49 @@ class LaserHeatingSimulation(SimulationBase):
             f"avg_k={avg_k:.1f}, avg_rho={avg_rho:.1f}, avg_cp={avg_cp:.1f}, "
             f"α={avg_alpha:.2e} m²/s")
 
+        
     def update_laser_source(self, t_real):
-        """Update laser heat source for current time step"""
-      
-
-        # Laser is stationary at center of mesh
+        """Update laser surface flux for current time step"""
+        
+        # Get geometry
         L = self.parameters['length']
         W = self.parameters['width']
-        H = self.parameters['height']
         
-        laser_x = L / 2  # Center of mesh
-        laser_y = W / 2  # Center of mesh
-        laser_z = H      # Top surface
-
-        laser_x = self.parameters.get('laser_x_position', L / 2)  # Default to center
-        laser_y = self.parameters.get('laser_y_position', W / 2)  # Default to center
-        laser_z = H  # Keep at top surface
+        # Get laser position
+        laser_x = self.parameters.get('laser_x_position', L / 2)
+        laser_y = self.parameters.get('laser_y_position', W / 2)
         
-        # Validate laser position is within mesh bounds
-        if not (0 <= laser_x <= L):
-            print(f"Warning: laser_x_position {laser_x} is outside mesh bounds [0, {L}]. Clamping.")
-            laser_x = max(0, min(laser_x, L))
+        # Validate position
+        laser_x = max(0, min(laser_x, L))
+        laser_y = max(0, min(laser_y, W))
         
-        if not (0 <= laser_y <= W):
-            print(f"Warning: laser_y_position {laser_y} is outside mesh bounds [0, {W}]. Clamping.")
-            laser_y = max(0, min(laser_y, W))
-        
-        # Laser parameters
+        # Get current power
         scale_factor = self.parameters.get('time_scale_factor', 1.0)
-
         if self.power_interpolator is not None:
-            current_power = self.power_interpolator(t_real)/np.sqrt(scale_factor)
+            current_power = self.power_interpolator(t_real) / np.sqrt(scale_factor)
             print(f"DEBUG: Using interpolator at t_real={t_real:.4f}s, power={current_power:.1f}W")
         else:
-            current_power = self.parameters['peak_laser_power']/scale_factor
+            current_power = self.parameters['peak_laser_power'] / scale_factor
             print(f"DEBUG: Using constant power={current_power:.1f}W")
-
-
-        radius = self.parameters['beam_radius']
-        absorptivity = self.parameters['absorptivity']
         
-        # Define Gaussian heat source
-        class LaserSource(df.UserExpression):
-            def __init__(self, laser_x, laser_y, laser_z, power, radius, absorptivity, **kwargs):
-                super().__init__(**kwargs)
-                self.laser_x = laser_x
-                self.laser_y = laser_y
-                self.laser_z = laser_z
-                self.power = power
-                self.radius = radius
-                self.absorptivity = absorptivity
-                
-            def eval(self, value, x):
-                # Distance from laser center
-                r_squared = (x[0] - self.laser_x)**2 + (x[1] - self.laser_y)**2
-            
-                # Gaussian distribution in x-y plane
-                intensity = (2* self.power * self.absorptivity) / (np.pi * self.radius**2)
-                gaussian = np.exp(-2 * r_squared / self.radius**2)
-                
-                # Depth attenuation (Beer-Lambert law)
-                penetration_depth = 1e-5  # m 
-                depth_from_surface = self.laser_z - x[2]
+        # Update flux parameters
+        self.laser_flux.set_parameters(
+            current_power,
+            laser_x,
+            laser_y,
+            self.parameters['beam_radius'],
+            self.parameters['absorptivity']
+        )
         
-                if depth_from_surface >= 0 and depth_from_surface <= 5 * penetration_depth:
-                    depth_factor = np.exp(-depth_from_surface / penetration_depth)
-                    volumetric_intensity = intensity * gaussian * depth_factor / penetration_depth
-                    value[0] = volumetric_intensity
-                else:
-                    value[0] = 0.0   
-
-            def value_shape(self):
-                return ()
-                
-        radius = self.parameters['beam_radius']
-        absorptivity = self.parameters['absorptivity']
+        # Calculate and display key information
+        absorbed_power = current_power * self.parameters['absorptivity']
+        peak_intensity = (2.0 * absorbed_power) / (np.pi * self.parameters['beam_radius']**2)
         
-        # Create and interpolate laser source
-        laser_expr = LaserSource(laser_x, laser_y, laser_z, current_power, radius, absorptivity, degree=2)
-        self.laser_source.interpolate(laser_expr)
-        
-        print(f"Laser at ({laser_x*1000:.2f}, {laser_y*1000:.2f}, {laser_z*1000:.2f}) mm")
-        print(f"Mesh bounds: (0, 0, 0) to ({L*1000:.2f}, {W*1000:.2f}, {H*1000:.2f}) mm")
-        print(f"Power: {current_power:.1f}W, Radius: {radius*1000:.2f}mm, Absorptivity: {absorptivity}")
-        
+        print(f"Laser at ({laser_x*1000:.2f}, {laser_y*1000:.2f}) mm")
+        print(f"Power: {current_power:.1f}W, Absorbed: {absorbed_power:.1f}W")
+        print(f"Beam radius: {self.parameters['beam_radius']*1000:.2f}mm")
+        print(f"Peak intensity: {peak_intensity/1e6:.1f} MW/m²")
+    
     def get_laser_position(self, t):
         """Get laser position at time t (stationary at center) Could be changed to move the laser"""
         L = self.parameters['length']
@@ -686,11 +722,20 @@ class LaserHeatingSimulation(SimulationBase):
             surface_temp_stats_list = []
             laser_spot_max_temps = []
             laser_spot_pyrometer_temps = []
-            bottom_avg_temperatures = []  # New list for bottom surface max temps
+            avg_temperatures_opposite_laser = []  # New list for bottom surface max temps
+            laser_spot_avg_temp = []
+            laser_pyro_avg_temp = []
+
             # Time stepping loop
             t_scaled = 0
             step = 0
             prev_max_temp = self.parameters['T_ambient']
+
+            L = self.parameters['length']
+            W = self.parameters['width']
+            laser_x = self.parameters.get('laser_x_position', L / 2)
+            laser_y = self.parameters.get('laser_y_position', W / 2)
+            beam_radius = self.parameters['beam_radius']
 
             print(f"SIMULATION SETUP:")
             print(f"  Total time: {self.parameters.get('total_time')} s")
@@ -717,7 +762,71 @@ class LaserHeatingSimulation(SimulationBase):
                 t_scaled += dt_scaled
                 step += 1
 
-                # Update time step using time solver
+                if self.parameters.get('use_adaptive_mesh', False):
+                    # Calculate temperature change rate
+                    temp_change_rate = abs(current_max_temp - prev_max_temp) / dt_scaled if dt_scaled > 0 else 0
+                    
+                    # Calculate gradient magnitude
+                    gradient = df.project(df.sqrt(df.dot(df.grad(self.u), df.grad(self.u))), 
+                                        df.FunctionSpace(self.mesh, 'DG', 0))
+                    gradient_magnitude = gradient.vector().max()
+                    
+                    # Check if we should adapt based on solution stability
+                    if self.mesh_handler.should_adapt_based_on_change(temp_change_rate, gradient_magnitude):
+                        # Also check minimum time between adaptations
+                        last_adapt_time = getattr(self, 'last_adaptation_time', -1.0)
+                        min_time_between = self.parameters.get('min_time_between_adaptations', 0.5)
+                        
+                        if t_scaled - last_adapt_time >= min_time_between:
+                            print(f"\n  === ADAPTING MESH (temp_change_rate={temp_change_rate:.1f} K/s) ===")
+                            
+                            new_mesh, mesh_changed = self.mesh_handler.adapt_mesh(
+                                self.u, t_scaled,
+                                max_cells=self.parameters.get('max_cells', 150000)
+                            )
+                            
+                            if mesh_changed:
+                                print(f"  === MESH ADAPTED at step {step} ===")
+                                self.last_adaptation_time = t_scaled
+                                
+                                # Transfer solution to new mesh
+                                self.mesh = new_mesh
+                                V_new = df.FunctionSpace(self.mesh, 'P', 1)
+                                
+                                # Use the new transfer method with projection
+                                u_new = self.mesh_handler.transfer_solution_with_projection(self.u, V_new)
+                                u_n_new = self.mesh_handler.transfer_solution_with_projection(self.u_n, V_new)
+                                
+                                # Apply conservative correction if needed
+                                if self.parameters.get('use_conservative_interpolation', True):
+                                    self.mesh_handler.conservative_interpolation(
+                                        self.u, self.mesh, u_new, new_mesh
+                                    )
+                                    self.mesh_handler.conservative_interpolation(
+                                        self.u_n, self.mesh, u_n_new, new_mesh
+                                    )
+                                
+                                # Update function space and solutions
+                                self.V = V_new
+                                self.u = u_new
+                                self.u_n = u_n_new
+                                
+                                # Rebuild variational form
+                                self._rebuild_variational_form_after_amr()
+                                
+                                print(f"  Mesh updated: {self.mesh.num_cells()} cells")
+                                print(f"  ==============================\n")
+
+                                is_ok, msg = self.mesh_handler.check_diffusion_length(dt_scaled)
+                                if not is_ok:
+                                    print(f"  WARNING after adaptation: {msg}")
+                                    
+                                    # Optionally reduce time step
+                                    if self.parameters.get('auto_adjust_dt_for_diffusion', True):
+                                        dt_stable = self.mesh_handler.calculate_stable_time_step()
+                                        dt_scaled = min(dt_scaled, dt_stable)
+                                        print(f"  Auto-adjusted dt to {dt_scaled:.2e}s")
+                
                 self.time_solver.update_dt(dt_scaled)
                 t_real = self.get_real_time(t_scaled)
 
@@ -759,6 +868,11 @@ class LaserHeatingSimulation(SimulationBase):
                     # Get RAW temperature values
                     temp_values = self.u.vector().get_local()
                     
+
+                    #get temp in spot size
+                    temp_spot = self.get_average_surface_temperature_in_laser_spot()
+                    temp_pyro_spot = self.get_average_surface_temperature_in_laser_spot(custom_radius_mm = 1.5)
+
                     print(f"STORING RAW DATA: Step {step}, t_real={t_real:.4f}, max_temp={current_max_temp:.1f}K")
                     
                     # Store all RAW data
@@ -770,7 +884,9 @@ class LaserHeatingSimulation(SimulationBase):
                     laser_spot_max_temps.append(laser_spot_max_temp)
                     laser_spot_pyrometer_temps.append(laser_spot_pyrometer_temp)
                     bottom_avg_temp = self.get_average_temperature_in_laser_spot_bottom_surface(self.u)
-                    bottom_avg_temperatures.append(bottom_avg_temp)
+                    avg_temperatures_opposite_laser.append(bottom_avg_temp)
+                    laser_spot_avg_temp.append(temp_spot)
+                    laser_pyro_avg_temp.append(temp_pyro_spot)
 
                     print(f"  Total data points stored: {len(times)}")
                     
@@ -802,8 +918,9 @@ class LaserHeatingSimulation(SimulationBase):
                 'surface_temp_stats': surface_temp_stats_list, 
                 'laser_spot_max_temperatures': laser_spot_max_temps,
                 'laser_spot_pyrometer_temperatures': laser_spot_pyrometer_temps,
-                'bottom_avg_temperatures': bottom_avg_temperatures,  # Add this line
-
+                'avg_temperatures_opposite_laser': avg_temperatures_opposite_laser,  # Add this line
+                'laser_spot_avg_temperatures': laser_spot_avg_temp,
+                'laser_pyro_avg_temperatures': laser_pyro_avg_temp,
                 # 'melt_pool_volumes': [0.0] * len(times),  # Placeholder
                 # 'heat_fluxes': [0.0] * len(times),  # Placeholder
                 'final_temperature_function': self.u.copy(), #deepcopy=Tru
@@ -825,6 +942,72 @@ class LaserHeatingSimulation(SimulationBase):
             raise
 
     # Replace the get_max_temperature_on_bottom_surface method with this:
+
+    def _rebuild_variational_form_after_amr(self):
+        """Rebuild variational form after mesh adaptation"""
+        
+        H = self.parameters['height']
+        k = self.parameters['k']
+        rho = self.parameters['rho']
+        cp = self.parameters['cp']
+        h_conv = self.parameters['convection_coeff']
+        T_ambient = self.parameters['T_ambient']
+        emissivity = self.parameters['emissivity']
+        sigma = self.parameters['stefan_boltzmann']
+        
+        # Recreate boundary markers for new mesh
+        boundaries = df.MeshFunction("size_t", self.mesh, self.mesh.topology().dim()-1)
+        boundaries.set_all(0)
+        
+        class TopSurface(df.SubDomain):
+            def inside(self, x, on_boundary):
+                return on_boundary and df.near(x[2], H)
+        
+        top_surface = TopSurface()
+        top_surface.mark(boundaries, 1)
+        
+        # Recreate boundary measure
+        self.ds = df.Measure('ds', domain=self.mesh, subdomain_data=boundaries)
+        
+        # Create new test function for new function space
+        v = df.TestFunction(self.V)
+        
+        # Rebuild variational form
+        if self.parameters.get('use_temperature_dependent_properties', False):
+            # Rebuild temp-dependent property functions
+            self.k_func = df.Function(self.V)
+            self.rho_func = df.Function(self.V)
+            self.cp_func = df.Function(self.V)
+            
+            k_base = self.parameters['k_base']
+            rho_base = self.parameters['rho_base']
+            cp_base = self.parameters['cp_base']
+            
+            self.k_func.assign(df.Constant(k_base))
+            self.rho_func.assign(df.Constant(rho_base))
+            self.cp_func.assign(df.Constant(cp_base))
+            
+            self.F = (self.rho_func * self.cp_func * (self.u - self.u_n) * v + 
+                    self.dt_param * self.k_func * df.dot(df.grad(self.u), df.grad(v))) * df.dx
+            
+            self.F += self.dt_param * emissivity * sigma * (self.u**4 - T_ambient**4) * v * df.ds
+            if h_conv > 0:
+                self.F += self.dt_param * h_conv * (self.u - T_ambient) * v * df.ds
+            
+            self.F -= self.dt_param * self.laser_flux * v * self.ds(1)
+        else:
+            # Standard constant properties
+            self.F = (rho*cp*(self.u-self.u_n)*v + 
+                    self.dt_param*k*df.dot(df.grad(self.u),df.grad(v)))*df.dx
+            
+            self.F += self.dt_param * emissivity * sigma * (self.u**4 - T_ambient**4) * v * df.ds
+            if h_conv > 0:
+                self.F += self.dt_param*h_conv*(self.u-T_ambient)*v*df.ds
+            
+            self.F -= self.dt_param * self.laser_flux * v * self.ds(1)
+        
+        print("  Variational form rebuilt for new mesh")
+
 
     def get_average_temperature_in_laser_spot_bottom_surface(self, temp_function=None):
         """
@@ -1144,15 +1327,97 @@ class LaserHeatingSimulation(SimulationBase):
         
         return pyrometer_temp
 
-    def get_average_surface_temperature_in_laser_spot(self, temp_function=None):
+    # def get_average_surface_temperature_in_laser_spot(self, temp_function=None):
+    #     """
+    #     Calculate average temperature on the surface within the laser spot radius
+        
+    #     Args:
+    #         temp_function: Temperature function to evaluate (uses self.u if None)
+        
+    #     Returns:
+    #         dict: Contains average temperature, number of points, and other statistics
+    #     """
+    #     if temp_function is None:
+    #         temp_function = self.u
+        
+    #     if temp_function is None:
+    #         return {'avg_temp': self.parameters['T_ambient'], 'num_points': 0}
+        
+    #     # Get laser parameters
+    #     L = self.parameters['length']
+    #     W = self.parameters['width'] 
+    #     H = self.parameters['height']
+    #     laser_radius = self.parameters['beam_radius']
+        
+    #     # Laser position (center of surface)
+    #     laser_x = L / 2
+    #     laser_y = W / 2
+    #     laser_z = H  # Top surface
+        
+    #     # Create sampling points within the laser spot
+    #     n_radial = 100  # Number of radial divisions
+    #     n_angular = 100  # Number of angular divisions
+        
+    #     temperatures = []
+    #     valid_points = 0
+        
+    #     # Sample at center point
+    #     try:
+    #         center_point = df.Point(laser_x, laser_y, laser_z)
+    #         center_temp = temp_function(center_point)
+    #         temperatures.append(center_temp)
+    #         valid_points += 1
+    #     except RuntimeError:
+    #         pass
+        
+    #     # Sample in concentric circles
+    #     for r_idx in range(1, n_radial + 1):
+    #         radius = (r_idx / n_radial) * laser_radius*10*4 #The two is a multiplier for larger radius
+            
+    #         for theta_idx in range(n_angular):
+    #             theta = (theta_idx / n_angular) * 2 * np.pi
+                
+    #             # Calculate point coordinates
+    #             x = laser_x + radius * np.cos(theta)
+    #             y = laser_y + radius * np.sin(theta)
+    #             z = laser_z
+                
+    #             # Check if point is within mesh bounds
+    #             if (0 <= x <= L) and (0 <= y <= W):
+    #                 try:
+    #                     point = df.Point(x, y, z)
+    #                     temp = temp_function(point)
+    #                     temperatures.append(temp)
+    #                     valid_points += 1
+    #                 except RuntimeError:
+    #                     # Point outside mesh domain
+    #                     continue
+        
+    #     if valid_points == 0:
+    #         return {
+    #             'avg_temp': self.parameters['T_ambient'],
+    #             'min_temp': self.parameters['T_ambient'],
+    #             'max_temp': self.parameters['T_ambient'],
+    #             'num_points': 0,
+    #             'std_temp': 0.0,
+    #             'sampling_radius_mm': laser_radius * 20 * 1000  # 2x radius in mm
+
+    #         }
+        
+    #     temperatures = np.array(temperatures)
+        
+    #     return {
+    #         'avg_temp': np.mean(temperatures),
+    #         'min_temp': np.min(temperatures),
+    #         'max_temp': np.max(temperatures),
+    #         'num_points': valid_points,
+    #         'std_temp': np.std(temperatures),
+    #         'laser_radius_mm': laser_radius * 1000 *20
+    #     }    
+
+    def get_average_surface_temperature_in_laser_spot(self, temp_function=None, custom_radius_mm = None):
         """
         Calculate average temperature on the surface within the laser spot radius
-        
-        Args:
-            temp_function: Temperature function to evaluate (uses self.u if None)
-        
-        Returns:
-            dict: Contains average temperature, number of points, and other statistics
         """
         if temp_function is None:
             temp_function = self.u
@@ -1164,16 +1429,19 @@ class LaserHeatingSimulation(SimulationBase):
         L = self.parameters['length']
         W = self.parameters['width'] 
         H = self.parameters['height']
-        laser_radius = self.parameters['beam_radius']
+        if custom_radius_mm is not None:
+            laser_radius = custom_radius_mm / 1000.0  # Convert mm to m
+        else:
+            laser_radius = self.parameters['beam_radius']
         
-        # Laser position (center of surface)
-        laser_x = L / 2
-        laser_y = W / 2
+        # Laser position
+        laser_x = self.parameters.get('laser_x_position', L / 2)
+        laser_y = self.parameters.get('laser_y_position', W / 2)
         laser_z = H  # Top surface
         
         # Create sampling points within the laser spot
-        n_radial = 100  # Number of radial divisions
-        n_angular = 100  # Number of angular divisions
+        n_radial = 10   # Match bottom surface sampling
+        n_angular = 30  # Angular divisions
         
         temperatures = []
         valid_points = 0
@@ -1187,27 +1455,27 @@ class LaserHeatingSimulation(SimulationBase):
         except RuntimeError:
             pass
         
-        # Sample in concentric circles
-        for r_idx in range(1, n_radial + 1):
-            radius = (r_idx / n_radial) * laser_radius*10*4 #The two is a multiplier for larger radius
+        # Sample in concentric circles - FIXED to match bottom surface
+        for r_frac in np.linspace(0, 1, n_radial):
+            r = r_frac * laser_radius  # REMOVED the *10*4 multiplier!
             
-            for theta_idx in range(n_angular):
-                theta = (theta_idx / n_angular) * 2 * np.pi
+            if r == 0:
+                continue  # Already sampled center
                 
-                # Calculate point coordinates
-                x = laser_x + radius * np.cos(theta)
-                y = laser_y + radius * np.sin(theta)
-                z = laser_z
+            # Points on circle
+            n_theta = max(8, int(2 * np.pi * r / (laser_radius / 5)))
+            for theta in np.linspace(0, 2 * np.pi, n_theta, endpoint=False):
+                x = laser_x + r * np.cos(theta)
+                y = laser_y + r * np.sin(theta)
                 
                 # Check if point is within mesh bounds
-                if (0 <= x <= L) and (0 <= y <= W):
+                if 0 <= x <= L and 0 <= y <= W:
                     try:
-                        point = df.Point(x, y, z)
+                        point = df.Point(x, y, laser_z)
                         temp = temp_function(point)
                         temperatures.append(temp)
                         valid_points += 1
                     except RuntimeError:
-                        # Point outside mesh domain
                         continue
         
         if valid_points == 0:
@@ -1217,8 +1485,7 @@ class LaserHeatingSimulation(SimulationBase):
                 'max_temp': self.parameters['T_ambient'],
                 'num_points': 0,
                 'std_temp': 0.0,
-                'sampling_radius_mm': laser_radius * 20 * 1000  # 2x radius in mm
-
+                'sampling_radius_mm': laser_radius * 1000  # Actual laser radius
             }
         
         temperatures = np.array(temperatures)
@@ -1229,9 +1496,9 @@ class LaserHeatingSimulation(SimulationBase):
             'max_temp': np.max(temperatures),
             'num_points': valid_points,
             'std_temp': np.std(temperatures),
-            'laser_radius_mm': laser_radius * 1000 *20
-        }    
-    
+            'sampling_radius_mm': laser_radius * 1000  # Actual laser radius
+        }
+
     # def plot_results(self, results, axes):
     #     """
     #     Plots for 3D FEniCS simulation with power scaling.
@@ -1492,8 +1759,8 @@ class LaserHeatingSimulation(SimulationBase):
                     linewidth=1.5, label='Global Max Temperature', alpha=0.7)
             
                 # ADD THIS: Plot bottom surface maximum temperature
-        if 'bottom_avg_temperatures' in results and len(results['bottom_avg_temperatures']) == len(times):
-            ax5.plot(times, results['bottom_avg_temperatures'], 'm-', 
+        if 'avg_temperatures_opposite_laser' in results and len(results['avg_temperatures_opposite_laser']) == len(times):
+            ax5.plot(times, results['avg_temperatures_opposite_laser'], 'm-', 
                     linewidth=2, label='Avg Bottom Temp (Laser Spot)', linestyle=':')
         
         # Add setpoint if using temperature control

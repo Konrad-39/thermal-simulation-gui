@@ -110,3 +110,50 @@ class SimulationBase:
             del self.u
         if hasattr(self, 'u_n'):
             del self.u_n
+
+    # Add this method to SimulationBase:
+
+    def verify_solver_consistency(self, other_simulation):
+        """Verify that two simulations use the same solver parameters"""
+        my_params = self.get_default_solver_params()
+        other_params = other_simulation.get_default_solver_params()
+        
+        def compare_dicts(d1, d2, path=""):
+            differences = []
+            for key in set(d1.keys()) | set(d2.keys()):
+                if key not in d1:
+                    differences.append(f"{path}.{key}: missing in first")
+                elif key not in d2:
+                    differences.append(f"{path}.{key}: missing in second")
+                elif isinstance(d1[key], dict) and isinstance(d2[key], dict):
+                    differences.extend(compare_dicts(d1[key], d2[key], f"{path}.{key}"))
+                elif d1[key] != d2[key]:
+                    differences.append(f"{path}.{key}: {d1[key]} != {d2[key]}")
+            return differences
+        
+        differences = compare_dicts(my_params, other_params)
+        
+        if differences:
+            print("Solver parameter differences found:")
+            for diff in differences:
+                print(f"  {diff}")
+            return False
+        else:
+            print("✓ Solver parameters are consistent")
+            return True
+
+    @staticmethod
+    def get_default_solver_params():
+        """Get default solver parameters used across all simulations"""
+        return {'nonlinear_solver': 'newton',
+                'newton_solver': {
+                    'linear_solver': 'mumps',
+                    'relative_tolerance': 1e-9,
+                    'absolute_tolerance': 1e-10,
+                    'maximum_iterations': 100,
+                    'preconditioner': 'default',
+                    'relaxation_parameter': 0.5,
+                    'error_on_nonconvergence': True,
+                    'convergence_criterion': 'incremental'
+                }
+            }

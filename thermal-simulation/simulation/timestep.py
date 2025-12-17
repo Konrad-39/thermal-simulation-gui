@@ -1,5 +1,6 @@
 import dolfin as df
 import numpy as np
+from simulation.base import SimulationBase
 
 class TimeSteppingSolver:
     """Handles time stepping and solver configuration for thermal simulations"""
@@ -8,7 +9,7 @@ class TimeSteppingSolver:
         self.parameters = parameters
         self.V = function_space
         self.mesh_handler = mesh_handler
-        self.solver_params = self._setup_solver_parameters()
+        self.solver_params = SimulationBase.get_default_solver_params()
         self.dt_param = None  # Will be set when needed
         
     def _setup_solver_parameters(self):

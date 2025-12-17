@@ -11,10 +11,20 @@ import threading
 import json
 import time
 from pathlib import Path
+
+try:
+    import dolfin as df
+    FENICS_AVAILABLE = True
+except ImportError:
+    FENICS_AVAILABLE = False
+    print("Warning: FEniCS not available in GUI")
+    df = None  # Set to None to handle gracefully
+
 # Import simulation classes
 from simulation.fixed_temp import FixedTempSimulation
 from simulation.laser_heating import LaserHeatingSimulation
 from simulation import check_dependencies
+from simulation.analytical_validation import AnalyticalValidationSimulation
 import math
 
 class ThermalSimulationGUI:
@@ -51,6 +61,7 @@ class ThermalSimulationGUI:
         
         self.create_gui()
 
+
     def create_gui(self):
         """Create the main GUI layout"""
         # Create main paned window
@@ -78,19 +89,24 @@ class ThermalSimulationGUI:
         type_frame.pack(fill='x', padx=5, pady=5)
         
         ttk.Radiobutton(type_frame, text="Fixed Temperature", 
-                       variable=self.sim_type_var, value="fixed_temp",
-                       command=self.on_sim_type_change).pack(anchor='w', padx=5, pady=2)
+                    variable=self.sim_type_var, value="fixed_temp",
+                    command=self.on_sim_type_change).pack(anchor='w', padx=5, pady=2)
+        
         ttk.Radiobutton(type_frame, text="Laser Heating", 
-                       variable=self.sim_type_var, value="laser_heating",
-                       command=self.on_sim_type_change).pack(anchor='w', padx=5, pady=2)
+                    variable=self.sim_type_var, value="laser_heating",
+                    command=self.on_sim_type_change).pack(anchor='w', padx=5, pady=2)
+        
+        ttk.Radiobutton(type_frame, text="Solver Validation", 
+               variable=self.sim_type_var, value="validation",
+               command=self.on_sim_type_change).pack(anchor='w', padx=5, pady=2)
         
         # Parameter notebook
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
         
-        # Create parameter tabs
+        # Create parameter tabs - NO NEED TO PASS PARENT, methods use self.notebook
         self.create_material_tab()
-        self.create_geometry_tab()
+        self.create_geometry_tab()  # This now uses self.notebook internally
         self.create_boundary_tab()
         self.create_simulation_tab()
         
@@ -104,6 +120,8 @@ class ThermalSimulationGUI:
     def create_material_tab(self):
         """Create material properties tab"""
         frame = ttk.Frame(self.notebook)
+        # parent.add(frame, text="Material")
+
         self.notebook.add(frame, text="Material")
         
         # Basic material properties
@@ -336,9 +354,17 @@ class ThermalSimulationGUI:
         # Add temperature-dependent property settings
         params['use_temperature_dependent_properties'] = self.use_temp_dep_var.get()
         params['property_variation_type'] = 'custom_equation'
+        params['use_graded_mesh'] = self.param_vars.get('use_graded_mesh', tk.BooleanVar()).get()
+        params['cells_across_beam'] = self.param_vars.get('cells_across_beam', tk.DoubleVar()).get()
+        params['z_resolution_microns'] = self.param_vars.get('z_resolution_microns', tk.DoubleVar()).get()
+        params['edge_cell_factor'] = self.param_vars.get('edge_cell_factor', tk.DoubleVar()).get()
+        
+        # Remove old mesh_resolution parameter
+        if 'mesh_resolution' in params:
+            del params['mesh_resolution']
         
         return params
-            
+                
     def start_timer(self):
         """Start the simulation timer"""
         import time
@@ -364,27 +390,61 @@ class ThermalSimulationGUI:
             # Schedule next update
             self.timer_job = self.root.after(1000, self.update_timer)
 
-    def create_geometry_tab(self):
+    # In gui_app.py, modify the geometry parameters:
+    def create_geometry_tab(self):  # Remove parent parameter
         """Create geometry parameters tab"""
         frame = ttk.Frame(self.notebook)
         self.notebook.add(frame, text="Geometry")
         
+        # Geometry parameters (remove mesh_resolution)
         geometry_params = [
-            ("Length (m)", "length", 0.008),
-            ("Width (m)", "width", 0.008),
-            ("Height (m)", "height", 0.0005),
-            ("Base Mesh Resolution", "mesh_resolution", 10),
+            ("Length (m)", "length", 0.0508),
+            ("Width (m)", "width", 0.0508),
+            ("Height (m)", "height", 0.001),
+            # ("Beam Radius (m)", "beam_radius", 0.00025),
         ]
         
         for i, (label, key, default) in enumerate(geometry_params):
             ttk.Label(frame, text=label).grid(row=i, column=0, sticky='w', padx=5, pady=5)
-            if key == "mesh_resolution":
-                var = tk.IntVar(value=default)
-            else:
-                var = tk.DoubleVar(value=default)
+            var = tk.DoubleVar(value=default)
             entry = ttk.Entry(frame, textvariable=var, width=15)
             entry.grid(row=i, column=1, padx=5, pady=5)
             self.param_vars[key] = var
+
+        # Add mesh strategy section
+        ttk.Label(frame, text="Mesh Strategy", font=('TkDefaultFont', 10, 'bold')).grid(
+            row=len(geometry_params), column=0, columnspan=2, pady=(10, 5))
+        
+        # Mesh strategy options
+        mesh_params = [
+            ("Cells across beam", "cells_across_beam", 4),
+            ("Z-resolution (μm)", "z_resolution_microns", 1.0),
+            ("Use graded mesh", "use_graded_mesh", True),
+            ("Max edge cell size factor", "edge_cell_factor", 10.0),
+        ]
+        
+        row_offset = len(geometry_params) + 1
+        for i, (label, key, default) in enumerate(mesh_params):
+            ttk.Label(frame, text=label).grid(row=row_offset+i, column=0, sticky='w', padx=5, pady=5)
+            
+            if isinstance(default, bool):
+                var = tk.BooleanVar(value=default)
+                widget = ttk.Checkbutton(frame, variable=var)
+            else:
+                var = tk.DoubleVar(value=default)
+                widget = ttk.Entry(frame, textvariable=var, width=15)
+            
+            widget.grid(row=row_offset+i, column=1, padx=5, pady=5)
+            self.param_vars[key] = var
+        
+        # Add info label
+        info_text = "Mesh will be automatically graded:\n" \
+                    "• Fine at laser spot (4 cells across beam)\n" \
+                    "• 1μm resolution through thickness\n" \
+                    "• Coarse at edges (based on thermal diffusion)"
+        
+        info_label = ttk.Label(frame, text=info_text, foreground="gray")
+        info_label.grid(row=row_offset+len(mesh_params), column=0, columnspan=2, pady=10)
 
     def create_boundary_tab(self):
         """Create boundary conditions tab"""
@@ -588,6 +648,106 @@ class ThermalSimulationGUI:
                     entry = ttk.Entry(self.boundary_frame, textvariable=var, width=15)
                     entry.grid(row=i, column=1, padx=5, pady=5)
                 self.param_vars[key] = var
+
+        # When creating the validation case dropdown
+        elif sim_type == "validation":
+            # Get available test cases
+            validation_sim = AnalyticalValidationSimulation()
+            test_cases = validation_sim.get_test_cases()  # This returns the flattened dict
+            
+            # First, let user select test case
+            row = 0
+            ttk.Label(self.boundary_frame, text="Test Case").grid(row=row, column=0, sticky='w', padx=5, pady=5)
+            
+            # Create list of test case names for display
+            test_case_names = list(test_cases.values())
+            test_case_ids = list(test_cases.keys())
+            
+            test_case_var = tk.StringVar(value=test_case_names[0])
+            test_case_combo = ttk.Combobox(self.boundary_frame, textvariable=test_case_var,
+                                        values=test_case_names, state="readonly", width=30)
+            test_case_combo.grid(row=row, column=1, columnspan=2, padx=5, pady=5)
+            
+            # Store the actual case ID, not the display name
+            self.param_vars['validation_case'] = tk.StringVar(value=test_case_ids[0])
+            
+            # Add description
+            desc_label = ttk.Label(self.boundary_frame, text="", font=('TkDefaultFont', 8), wraplength=300)
+            desc_label.grid(row=row+1, column=0, columnspan=3, sticky='w', padx=5)
+            
+            # Function to update parameters based on test case
+            def update_validation_params(*args):
+                selected_name = test_case_var.get()
+                # Find the corresponding case ID
+                selected_id = None
+                for case_id, case_name in test_cases.items():
+                    if case_name == selected_name:
+                        selected_id = case_id
+                        break
+                
+                if selected_id:
+                    # Update the actual parameter
+                    self.param_vars['validation_case'].set(selected_id)
+                    
+                    # Get case info
+                    for dim, cases in validation_sim.test_cases.items():
+                        if selected_id in cases:
+                            desc_label.config(text=f"Reference: {cases[selected_id]['reference']}")
+                            break
+                
+                # Clear existing parameter widgets (keep test case selector and description)
+                for widget in self.boundary_frame.winfo_children():
+                    info = widget.grid_info()
+                    if info and info.get('row', 0) > 1:  # Keep first two rows
+                        widget.destroy()
+                
+                # Get parameters for this case
+                case_params = validation_sim.get_parameters_for_case(selected_id)
+                
+                # Add parameter inputs based on the case
+                row_offset = 2
+                for i, param_key in enumerate(case_params):
+                    # Get default value from validation_sim
+                    default_val = validation_sim.parameters.get(param_key, 0.0)
+                    
+                    # Create label
+                    label_text = param_key.replace('_', ' ').title()
+                    ttk.Label(self.boundary_frame, text=label_text).grid(
+                        row=row_offset + i, column=0, sticky='w', padx=5, pady=2)
+                    
+                    # Create entry
+                    if isinstance(default_val, (int, float)):
+                        var = tk.DoubleVar(value=default_val)
+                    else:
+                        var = tk.StringVar(value=str(default_val))
+                    
+                    entry = ttk.Entry(self.boundary_frame, textvariable=var, width=15)
+                    entry.grid(row=row_offset + i, column=1, padx=5, pady=2)
+                    self.param_vars[param_key] = var
+                
+                # Add common simulation parameters
+                common_params = [
+                    ("Total Time (s)", "total_time", 10.0),
+                    ("Time Step (s)", "dt", 0.01),
+                    ("Output Interval", "output_interval", 10),
+                ]
+                
+                row_offset += len(case_params)
+                for i, (label, key, default) in enumerate(common_params):
+                    ttk.Label(self.boundary_frame, text=label).grid(
+                        row=row_offset + i, column=0, sticky='w', padx=5, pady=2)
+                    
+                    var = tk.DoubleVar(value=default)
+                    entry = ttk.Entry(self.boundary_frame, textvariable=var, width=15)
+                    entry.grid(row=row_offset + i, column=1, padx=5, pady=2)
+                    self.param_vars[key] = var
+            
+            # Bind the update function to test case selection
+            test_case_combo.bind('<<ComboboxSelected>>', update_validation_params)
+            
+            # Initialize with first test case
+            update_validation_params()
+        
                 
         elif sim_type == "laser_heating":
             # Laser heating parameters
@@ -701,6 +861,15 @@ class ThermalSimulationGUI:
                                     command=self.stop_simulation, state='disabled')
         self.stop_button.pack(side='left', padx=5)
         
+        # self.notebook = ttk.Notebook(parent)
+        # self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # # Create parameter tabs - PASS THE NOTEBOOK AS PARENT
+        # self.create_material_tab(self.notebook)  # Add parent argument
+        # self.create_geometry_tab(self.notebook)  # Add parent argument
+        # self.create_boundary_tab()  # This might need parent too
+        # self.create_simulation_tab()
+
         ttk.Button(button_frame, text="Clear Results", 
                   command=self.clear_results).pack(side='left', padx=5)
         
@@ -817,6 +986,8 @@ class ThermalSimulationGUI:
                 except ValueError:
                     messagebox.showerror("Error", "Invalid laser Y position. Use a number or 'center'")
                     return None  # Return None to indicate error
+
+        print(f"DEBUG get_parameters: All params = {params}")
         
         return params
 
@@ -913,6 +1084,10 @@ class ThermalSimulationGUI:
             # Get parameters (thread-safe copy)
             params = self.get_parameters()
             
+            sim_type = self.sim_type_var.get()
+            print(f"DEBUG: Simulation type: {sim_type}")
+            print(f"DEBUG: Parameters: {params}")
+
             # Parameter name mapping for compatibility
             if 'laser_power' in params and 'peak_laser_power' not in params:
                 params['peak_laser_power'] = params['laser_power']
@@ -927,11 +1102,28 @@ class ThermalSimulationGUI:
                 self.current_simulation = FixedTempSimulation()
             elif sim_type == "laser_heating":
                 self.current_simulation = LaserHeatingSimulation()
+            elif sim_type == "validation":
+                self.current_simulation = AnalyticalValidationSimulation()
+                
+                # Parse validation times
+                if 'validation_times_str' in params:
+                    try:
+                        times_str = params['validation_times_str']
+                        times = [float(t.strip()) for t in times_str.split(',')]
+                        params['validation_times'] = times
+                        params.pop('validation_times_str')  # Remove the string version
+                    except Exception as e:
+                        print(f"Error parsing validation times: {e}")
+                        print("Using default validation times")
             else:
                 raise ValueError(f"Unknown simulation type: {sim_type}")
             
             # Set parameters
+            print(f"DEBUG: Setting parameters on simulation: {params}")
             self.current_simulation.set_parameters(params)
+
+            # Debug: Check what the simulation thinks its parameters are
+            print(f"DEBUG: Simulation parameters after set: {self.current_simulation.parameters}")
             
             # Update status
             self.root.after(0, lambda: self.status_var.set("Running simulation..."))

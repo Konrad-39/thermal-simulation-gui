@@ -37,8 +37,11 @@ DEFAULT_SIMULATION_SETTINGS = {
 from .base import SimulationBase
 from .fixed_temp import FixedTempSimulation
 from .laser_heating import LaserHeatingSimulation
+from .analytical_validation import AnalyticalValidationSimulation
 
-__all__ = ['SimulationBase', 'FixedTempSimulation', 'LaserHeatingSimulation']
+
+__all__ = ['SimulationBase', 'FixedTempSimulation', 'LaserHeatingSimulation', 
+           'AnalyticalValidationSimulation']
 
 def check_dependencies():
     """Check if all required dependencies are available"""
